@@ -29,6 +29,8 @@ npm run start:production
 
 Production uses the Claude API (`ANTHROPIC_API_KEY`) for campaign emails, product descriptions, and lead briefings. The server refuses to start in production (`--production`, or `NODE_ENV=production`) unless `ANTHROPIC_API_KEY`, `SUPABASE_URL`, and `SUPABASE_SECRET_KEY` are all set, and it never allows subscription mode. On a hosting platform, set those three as environment variables rather than uploading `.env`, and set `PORT` if the platform requires it.
 
+On Vercel, the app deploys with zero configuration: `server.js` runs as a single function and `public/` is served by the CDN. Add the three environment variables in the Vercel project settings (Vercel sets `NODE_ENV=production`, so the server won't start without them). Vercel limits request bodies to 4.5 MB, so individual product document uploads need to stay under about 3 MB.
+
 ### Testing with your Claude subscription
 
 For your own local testing, the app can use your Claude subscription (Pro or Max) instead of an API key, through the Claude Agent SDK:
@@ -56,11 +58,11 @@ Email sending and open/click tracking aren't connected yet, so the Qualified Lea
 server.js        Serves the app and calls Claude for campaign emails
 skills/campaign-email/SKILL.md   Instructions Claude follows to write each campaign email
 skills/lead-brief/SKILL.md       Instructions Claude follows to write each lead briefing
-index.html       Page shell and navigation
-css/styles.css   Herald theme
+public/index.html       Page shell and navigation
+public/css/styles.css   Herald theme
 db.js            Supabase reads and writes (server only)
 supabase/        Supabase config and migrations (schema and demo data)
-js/app.js        Views, routing, and campaign flow
+public/js/app.js        Views, routing, and campaign flow
 ```
 
 ## Placeholders to replace

@@ -13,7 +13,6 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as db from "./db.js";
-import { NotSignedInError, runWithSubscription } from "./subscription-engine.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 8080;
@@ -37,6 +36,14 @@ if (PRODUCTION) {
   }
 }
 const client = ENGINE === "api" ? new Anthropic() : null;
+
+// Subscription mode (local testing only) is loaded on demand. The module
+// path is a variable so hosting bundlers such as Vercel's don't pull in the
+// Agent SDK and its bundled Claude Code binary, which production never uses.
+const SUBSCRIPTION_MODULE = "./subscription-engine.js";
+const subscription = ENGINE === "subscription" ? await import(SUBSCRIPTION_MODULE) : null;
+const runWithSubscription = (options) => subscription.runWithSubscription(options);
+const isNotSignedIn = (err) => Boolean(subscription && err instanceof subscription.NotSignedInError);
 
 // In subscription mode, product documents are saved here so Claude Code can
 // read them. The folder is ignored by git.
@@ -105,9 +112,15 @@ function sendApiError(res, err, what) {
 
 // ---------- Campaign email skill ----------
 
-// Skills are read on each request so edits apply without a restart.
+// Skills are read on each request so edits apply without a restart. The
+// paths are written out in full so hosting bundlers include the files.
+const SKILL_FILES = {
+  "campaign-email": new URL("./skills/campaign-email/SKILL.md", import.meta.url),
+  "lead-brief": new URL("./skills/lead-brief/SKILL.md", import.meta.url),
+};
+
 async function loadSkill(name) {
-  const text = await readFile(path.join(here, "skills", name, "SKILL.md"), "utf8");
+  const text = await readFile(SKILL_FILES[name], "utf8");
   return text.replace(/^---[\s\S]*?---\s*/, "").trim();
 }
 
@@ -185,7 +198,7 @@ async function runSkill({ skill, product, stored, taskText, schema, site, effort
 
 // Sends the right response for an error thrown while running a skill.
 function sendSkillError(res, err, what) {
-  if (err instanceof NotSignedInError) {
+  if (isNotSignedIn(err)) {
     return res.status(503).json({ error: "not_signed_in", message: "Claude Code isn't signed in on this machine. Run: npm run login" });
   }
   if (err instanceof SkillError) {
@@ -400,7 +413,7 @@ app.post("/api/products/:id/describe", async (req, res) => {
       return res.status(422).json({ error: "refused", message: "A description couldn't be written from these documents." });
     }
   } catch (err) {
-    if (err instanceof NotSignedInError) {
+    if (isNotSignedIn(err)) {
       return res.status(503).json({ error: "not_signed_in", message: "Claude Code isn't signed in on this machine. Run: npm run login" });
     }
     if (err instanceof Anthropic.APIError) return sendApiError(res, err, "description");
@@ -639,9 +652,8 @@ app.post("/api/leads/:id/brief", async (req, res) => {
 });
 
 // Serve only the web app's own files, not the server code or .env.
-app.use("/css", express.static(path.join(here, "css")));
-app.use("/js", express.static(path.join(here, "js")));
-app.get("/", (req, res) => res.sendFile(path.join(here, "index.html")));
+// On Vercel, public/ is served by the CDN and this line is ignored.
+app.use(express.static(path.join(here, "public")));
 
 app.listen(PORT, () => {
   console.log(`Agincourt running at http://localhost:${PORT}`);
