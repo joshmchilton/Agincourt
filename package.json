@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
     "start:local": "node --env-file-if-exists=.env server.js --subscription",
+    "start:production": "node --env-file-if-exists=.env server.js --production",
     "login": "node scripts/claude-login.mjs",
     "login:status": "node scripts/claude-login.mjs status"
   },

@@ -20,7 +20,22 @@ const PORT = Number(process.env.PORT) || 8080;
 const MODEL = "claude-opus-5";
 
 const hasCredentials = Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
+const PRODUCTION = process.argv.includes("--production") || process.env.NODE_ENV === "production";
 const ENGINE = process.argv.includes("--subscription") ? "subscription" : hasCredentials ? "api" : null;
+
+// Production must use the Claude API: Anthropic doesn't allow claude.ai
+// (subscription) login in products offered to other people. Fail fast
+// rather than running half-configured.
+if (PRODUCTION) {
+  const problems = [];
+  if (ENGINE === "subscription") problems.push("--subscription can't be used in production; use ANTHROPIC_API_KEY.");
+  if (!hasCredentials) problems.push("ANTHROPIC_API_KEY isn't set.");
+  if (!db.dbConfigured) problems.push("SUPABASE_URL and SUPABASE_SECRET_KEY must be set.");
+  if (problems.length) {
+    console.error(`Agincourt can't start in production:\n- ${problems.join("\n- ")}`);
+    process.exit(1);
+  }
+}
 const client = ENGINE === "api" ? new Anthropic() : null;
 
 // In subscription mode, product documents are saved here so Claude Code can

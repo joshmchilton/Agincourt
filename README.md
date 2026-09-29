@@ -21,6 +21,14 @@ Copy `.env.example` to `.env` and add your Supabase secret key (Supabase dashboa
 
 To write campaign emails with Claude, also add an Anthropic API key. Without a key the app still runs, and the campaign preview uses a basic template.
 
+### Production
+
+```bash
+npm run start:production
+```
+
+Production uses the Claude API (`ANTHROPIC_API_KEY`) for campaign emails, product descriptions, and lead briefings. The server refuses to start in production (`--production`, or `NODE_ENV=production`) unless `ANTHROPIC_API_KEY`, `SUPABASE_URL`, and `SUPABASE_SECRET_KEY` are all set, and it never allows subscription mode. On a hosting platform, set those three as environment variables rather than uploading `.env`, and set `PORT` if the platform requires it.
+
 ### Testing with your Claude subscription
 
 For your own local testing, the app can use your Claude subscription (Pro or Max) instead of an API key, through the Claude Agent SDK:
