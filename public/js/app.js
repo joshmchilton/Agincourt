@@ -440,22 +440,8 @@
         </div>
       </div>
 
-      <div class="card heat-card heat-card-${leadHeat.level}">
-        <div>
-          <span class="metric-label">Heat score</span>
-          <div class="heat-card-score"><span class="metric-value">${leadHeat.score}</span><span class="heat heat-${leadHeat.level}">${leadHeat.label}</span></div>
-        </div>
-        <ul class="heat-breakdown">
-          ${leadHeat.parts.map((p) => `
-            <li>
-              <span>${esc(p.label)}</span>
-              <span class="heat-bar" aria-hidden="true"><span style="width:${Math.round((p.points / p.max) * 100)}%"></span></span>
-              <span class="heat-points">${p.points}/${p.max}</span>
-            </li>`).join("")}
-        </ul>
-      </div>
-
       <div class="metrics lead-metrics">
+        <div class="card"><span class="metric-label">Heat score</span><span class="metric-value">${leadHeat.score}</span><span><span class="heat heat-${leadHeat.level}">${leadHeat.label}</span></span></div>
         <div class="card"><span class="metric-label">Email opened</span><span class="metric-value">Yes</span><span class="sub">${esc(formatWhen(lead.openedAt))}</span></div>
         <div class="card"><span class="metric-label">Time reading email</span><span class="metric-value">${formatDuration(lead.readSeconds)}</span></div>
         <div class="card"><span class="metric-label">Clicked through</span><span class="metric-value">${lead.clickedThrough ? "Yes" : "No"}</span></div>

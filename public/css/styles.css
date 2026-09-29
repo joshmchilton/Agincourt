@@ -510,19 +510,5 @@ td.row-actions { white-space: nowrap; text-align: right; }
 .heat-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 13px; color: var(--ink-soft); }
 .heat-legend strong { color: var(--ink); }
 
-.heat-card { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px 32px; align-items: center; margin-bottom: 16px; border-left: 4px solid var(--slate); border-radius: 0 var(--radius-lg) var(--radius-lg) 0; }
-.heat-card-hot { border-left-color: #C4623F; }
-.heat-card-warm { border-left-color: #C99A2E; }
-.heat-card-score { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
-.heat-card-score .metric-value { font-size: 32px; }
-.heat-breakdown { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; color: var(--ink-soft); }
-.heat-breakdown li { display: grid; grid-template-columns: 170px minmax(60px, 1fr) 44px; align-items: center; gap: 10px; }
-.heat-bar { height: 6px; border-radius: 999px; background: var(--paper); border: 1px solid var(--line); overflow: hidden; }
-.heat-bar span { display: block; height: 100%; background: var(--sage); }
-.heat-points { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
 
-@media (max-width: 640px) {
-  .heat-card { grid-template-columns: 1fr; }
-  .heat-breakdown li { grid-template-columns: 1fr 60px 40px; }
-}
 .leads-table td:nth-child(2) .lead-link { white-space: nowrap; }
