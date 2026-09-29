@@ -4,10 +4,11 @@
   const data = window.AGINCOURT_DATA;
   const app = document.getElementById("app");
   const NAMES_KEY = "agincourt.productNames";
+  const CUSTOMERS_KEY = "agincourt.customers";
 
   const state = {
     products: data.products.map((p) => ({ ...p, files: [], description: "" })),
-    customers: data.customers,
+    customers: loadCustomers(),
     // Active campaign: { productId, selected: Set<customerId>, launched: bool }
     campaign: null,
     search: "",
@@ -41,6 +42,34 @@
       const saved = JSON.parse(localStorage.getItem(NAMES_KEY) || "{}");
       state.products.forEach((p) => { if (saved[p.id]) p.name = saved[p.id]; });
     } catch (e) { /* storage unavailable */ }
+  }
+
+  function loadCustomers() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(CUSTOMERS_KEY));
+      if (Array.isArray(saved)) return saved;
+    } catch (e) { /* storage unavailable */ }
+    return data.customers.slice();
+  }
+
+  function saveCustomers() {
+    try {
+      localStorage.setItem(CUSTOMERS_KEY, JSON.stringify(state.customers));
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  function nextCustomerId() {
+    return state.customers.reduce((max, c) => Math.max(max, c.id), 0) + 1;
+  }
+
+  function formatEmployees(value) {
+    if (value === "" || value == null) return "";
+    const n = Number(value);
+    return Number.isFinite(n) ? n.toLocaleString("en-GB") : String(value);
+  }
+
+  function websiteHref(site) {
+    return /^https?:\/\//i.test(site) ? site : "https://" + site;
   }
 
   function saveProductNames() {
@@ -86,17 +115,22 @@
   }
 
   function generateEmail(contact, product) {
-    const first = contact.name.split(" ")[0];
+    const first = (contact.name || "").split(" ")[0] || "there";
+    const role = contact.role || "";
+    const company = contact.company || "your team";
     const productLine = product.description
       ? `${product.name} is built for exactly that. ${product.description}`
       : `${product.name} is built to help with exactly that.`;
+    const opener = role
+      ? `I've been looking at what ${company} is working on, and as ${role} I imagine ${roleAngle(role)} to you.`
+      : `I've been looking at what ${company} is working on, and I imagine ${roleAngle(role)} to you.`;
     return {
-      subject: `${product.name} for ${contact.company}`,
+      subject: contact.company ? `${product.name} for ${contact.company}` : product.name,
       paragraphs: [
         `Hi ${first},`,
-        `I've been looking at what ${contact.company} is working on, and as ${contact.role} I imagine ${roleAngle(contact.role)} to you.`,
+        opener,
         productLine,
-        `Would a 20-minute call next week be useful to see how it would fit ${contact.company}?`,
+        `Would a 20-minute call next week be useful to see how it would fit ${company}?`,
       ],
     };
   }
@@ -239,9 +273,15 @@
           </div>
         </div>` : ""}
       <div class="toolbar">
-        <input class="search" type="search" placeholder="Search name, company or email" value="${esc(state.search)}" aria-label="Search customers">
+        <input class="search" type="search" placeholder="Search name, company, industry or email" value="${esc(state.search)}" aria-label="Search customers">
+        <div class="actions toolbar-actions">
+          <button class="btn" id="add-contact">Add contact</button>
+          <button class="btn" id="import-contacts">Upload from file</button>
+        </div>
       </div>
-      <div class="table-wrap"><table id="customer-table"></table></div>`;
+      <div class="table-wrap"><table id="customer-table"></table></div>
+      ${addContactDialog()}
+      ${importDialog()}`;
 
     renderCustomerTable();
 
@@ -249,6 +289,9 @@
       state.search = e.target.value;
       renderCustomerTable();
     });
+
+    wireAddContact();
+    wireImport();
 
     if (campaign) {
       app.querySelector("#continue").addEventListener("click", () => {
@@ -270,8 +313,9 @@
     const table = app.querySelector("#customer-table");
     const q = state.search.trim().toLowerCase();
     const rows = state.customers.filter((c) =>
-      !q || [c.name, c.company, c.email, c.role].some((v) => v.toLowerCase().includes(q))
+      !q || [c.name, c.company, c.email, c.role, c.industry, c.website].some((v) => String(v || "").toLowerCase().includes(q))
     );
+    const columnCount = 8 + state.products.length + (campaign ? 1 : 0);
 
     const allSelected = campaign && rows.length > 0 && rows.every((c) => campaign.selected.has(c.id));
 
@@ -281,6 +325,9 @@
           ${campaign ? `<th class="center"><input type="checkbox" id="select-all" ${allSelected ? "checked" : ""} aria-label="Select all"></th>` : ""}
           <th>Contact name</th>
           <th>Contact company</th>
+          <th>Company website</th>
+          <th class="num"># Employees</th>
+          <th>Industry</th>
           <th>Contact email</th>
           <th>Contact phone number</th>
           ${state.products.map((p) => `<th class="center ${campaign && campaign.productId === p.id ? "highlight" : ""}">${esc(p.name)}</th>`).join("")}
@@ -293,7 +340,10 @@
           <tr class="${isSelected ? "selected" : ""}">
             ${campaign ? `<td class="center"><input type="checkbox" data-customer="${c.id}" ${isSelected ? "checked" : ""} aria-label="Select ${esc(c.name)}"></td>` : ""}
             <td>${esc(c.name)}<span class="sub">${esc(c.role)}</span></td>
-            <td>${esc(c.company)}<span class="sub">${esc(c.website)}</span></td>
+            <td>${esc(c.company)}</td>
+            <td>${c.website ? `<a class="site-link" href="${esc(websiteHref(c.website))}" target="_blank" rel="noopener">${esc(c.website)}</a>` : ""}</td>
+            <td class="num">${esc(formatEmployees(c.employees))}</td>
+            <td>${esc(c.industry || "")}</td>
             <td>${esc(c.email)}</td>
             <td style="white-space:nowrap">${esc(c.phone)}</td>
             ${state.products.map((p) => c.products.includes(p.id)
@@ -301,7 +351,7 @@
               : `<td class="center"><span class="mark no" title="Doesn't buy ${esc(p.name)}">✕</span></td>`).join("")}
           </tr>`;
         }).join("")}
-        ${rows.length === 0 ? `<tr><td colspan="${campaign ? 8 : 7}" class="empty-note">No customers match your search.</td></tr>` : ""}
+        ${rows.length === 0 ? `<tr><td colspan="${columnCount}" class="empty-note">No customers match your search.</td></tr>` : ""}
       </tbody>`;
 
     if (!campaign) return;
@@ -329,6 +379,244 @@
   function updateSelectedCount() {
     const el = app.querySelector("#selected-count");
     if (el) el.textContent = `${state.campaign.selected.size} of ${state.customers.length} customers selected`;
+  }
+
+  // ---------- Adding contacts ----------
+
+  // A new contact joins an active campaign if they don't buy its product,
+  // matching how the campaign's suggested list was built.
+  function addToCampaignIfEligible(contact) {
+    const campaign = state.campaign;
+    if (campaign && !contact.products.includes(campaign.productId)) {
+      campaign.selected.add(contact.id);
+    }
+  }
+
+  function addContactDialog() {
+    const field = (name, label, type = "text", placeholder = "") => `
+      <label class="field">
+        <span>${label}</span>
+        <input name="${name}" type="${type}" placeholder="${placeholder}">
+      </label>`;
+    return `
+      <dialog id="add-dialog" class="dialog">
+        <form method="dialog" novalidate>
+          <h2>Add contact</h2>
+          <div class="field-grid">
+            ${field("name", "Contact name *", "text", "Jane Smith")}
+            ${field("role", "Job role", "text", "Operations Director")}
+            ${field("company", "Contact company", "text", "Acme Ltd")}
+            ${field("website", "Company website", "text", "acme.co.uk")}
+            ${field("employees", "# Employees", "number", "250")}
+            ${field("industry", "Industry", "text", "Manufacturing")}
+            ${field("email", "Contact email *", "email", "jane.smith@acme.co.uk")}
+            ${field("phone", "Contact phone number", "tel", "01632 960 000")}
+          </div>
+          <fieldset class="product-checks">
+            <legend>Products they currently buy</legend>
+            ${state.products.map((p) => `
+              <label><input type="checkbox" name="products" value="${p.id}"> ${esc(p.name)}</label>`).join("")}
+          </fieldset>
+          <p class="form-error" id="add-error" role="alert"></p>
+          <div class="dialog-actions">
+            <button type="button" class="btn" data-close>Cancel</button>
+            <button type="submit" class="btn btn-primary">Add contact</button>
+          </div>
+        </form>
+      </dialog>`;
+  }
+
+  function wireAddContact() {
+    const dialog = app.querySelector("#add-dialog");
+    const form = dialog.querySelector("form");
+    const error = dialog.querySelector("#add-error");
+
+    app.querySelector("#add-contact").addEventListener("click", () => {
+      form.reset();
+      error.textContent = "";
+      dialog.showModal();
+    });
+    dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
+    form.addEventListener("input", () => { error.textContent = ""; });
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const values = Object.fromEntries(new FormData(form));
+      const name = (values.name || "").trim();
+      const email = (values.email || "").trim();
+      if (!name) { error.textContent = "Enter a contact name."; return; }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { error.textContent = "Enter a valid email address."; return; }
+
+      const contact = {
+        id: nextCustomerId(),
+        name,
+        role: (values.role || "").trim(),
+        company: (values.company || "").trim(),
+        website: (values.website || "").trim(),
+        employees: values.employees === "" ? "" : Number(values.employees),
+        industry: (values.industry || "").trim(),
+        email,
+        phone: (values.phone || "").trim(),
+        products: new FormData(form).getAll("products"),
+      };
+      state.customers.push(contact);
+      addToCampaignIfEligible(contact);
+      saveCustomers();
+      dialog.close();
+      renderCustomerTable();
+    });
+  }
+
+  // ---------- Importing contacts ----------
+  // Reads .xlsx, .xls or .csv with SheetJS. Column headers are matched
+  // loosely so small differences in the customer's spreadsheet still work.
+
+  const HEADER_ALIASES = {
+    name: ["contactname", "name", "fullname"],
+    role: ["jobrole", "jobtitle", "role", "title", "position"],
+    company: ["contactcompany", "company", "companyname", "organisation", "organization", "account"],
+    website: ["companywebsite", "website", "url", "domain", "web"],
+    employees: ["employees", "numberofemployees", "noofemployees", "employeecount", "headcount", "companysize"],
+    industry: ["industry", "sector"],
+    email: ["contactemail", "email", "emailaddress"],
+    phone: ["contactphonenumber", "phone", "phonenumber", "telephone", "tel", "mobile"],
+  };
+  const TEMPLATE_HEADERS = ["Contact name", "Job role", "Contact company", "Company website", "# Employees", "Industry", "Contact email", "Contact phone number"];
+
+  function normaliseHeader(h) {
+    return String(h).toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+
+  function isYes(value) {
+    return /^(y|yes|true|1|x|✓|✔|tick)$/i.test(String(value).trim());
+  }
+
+  function rowToContact(row) {
+    const byHeader = {};
+    Object.keys(row).forEach((h) => { byHeader[normaliseHeader(h)] = row[h]; });
+    const pick = (key) => {
+      const alias = HEADER_ALIASES[key].find((a) => a in byHeader);
+      return alias ? String(byHeader[alias]).trim() : "";
+    };
+
+    const products = state.products
+      .filter((p) => {
+        const keys = [normaliseHeader(p.name), normaliseHeader(p.id), "product" + p.id.slice(1)];
+        return keys.some((k) => k in byHeader && isYes(byHeader[k]));
+      })
+      .map((p) => p.id);
+
+    const employees = pick("employees").replace(/,/g, "");
+    return {
+      name: pick("name"),
+      role: pick("role"),
+      company: pick("company"),
+      website: pick("website"),
+      employees: employees !== "" && Number.isFinite(Number(employees)) ? Number(employees) : employees,
+      industry: pick("industry"),
+      email: pick("email"),
+      phone: pick("phone"),
+      products,
+    };
+  }
+
+  function importDialog() {
+    return `
+      <dialog id="import-dialog" class="dialog">
+        <form method="dialog" novalidate>
+          <h2>Upload contacts</h2>
+          <p class="dialog-note">Upload an Excel (.xlsx, .xls) or CSV file. The first sheet is read and the first row should be column headers.</p>
+          <p class="dialog-note">Expected columns: ${TEMPLATE_HEADERS.join(", ")}, plus one column per product (${state.products.map((p) => esc(p.name)).join(", ")}) marked Yes or No.</p>
+          <label class="field">
+            <span>File</span>
+            <input type="file" name="file" accept=".xlsx,.xls,.csv">
+          </label>
+          <fieldset class="product-checks">
+            <legend>Existing contacts</legend>
+            <label><input type="radio" name="mode" value="add" checked> Add to existing contacts</label>
+            <label><input type="radio" name="mode" value="replace"> Replace all existing contacts</label>
+          </fieldset>
+          <p class="form-error" id="import-error" role="alert"></p>
+          <div class="dialog-actions">
+            <button type="button" class="btn btn-link" id="download-template">Download template</button>
+            <button type="button" class="btn" data-close>Cancel</button>
+            <button type="submit" class="btn btn-primary">Upload</button>
+          </div>
+        </form>
+      </dialog>`;
+  }
+
+  function wireImport() {
+    const dialog = app.querySelector("#import-dialog");
+    const form = dialog.querySelector("form");
+    const error = dialog.querySelector("#import-error");
+
+    app.querySelector("#import-contacts").addEventListener("click", () => {
+      form.reset();
+      error.textContent = "";
+      dialog.showModal();
+    });
+    dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
+    form.addEventListener("change", () => { error.textContent = ""; });
+
+    dialog.querySelector("#download-template").addEventListener("click", () => {
+      if (!window.XLSX) { error.textContent = "The spreadsheet reader didn't load. Check your connection and reload."; return; }
+      const headers = TEMPLATE_HEADERS.concat(state.products.map((p) => p.name));
+      const example = ["Jane Smith", "Operations Director", "Acme Ltd", "acme.co.uk", 250, "Manufacturing", "jane.smith@acme.co.uk", "01632 960 000"]
+        .concat(state.products.map((_, i) => (i === 0 ? "Yes" : "No")));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([headers, example]), "Contacts");
+      XLSX.writeFile(wb, "agincourt-contacts-template.xlsx");
+    });
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const file = form.file.files[0];
+      if (!file) { error.textContent = "Choose a file to upload."; return; }
+      if (!window.XLSX) { error.textContent = "The spreadsheet reader didn't load. Check your connection and reload."; return; }
+
+      let rows;
+      try {
+        const wb = XLSX.read(await file.arrayBuffer());
+        rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
+      } catch (err) {
+        error.textContent = "That file couldn't be read. Upload an .xlsx, .xls or .csv file.";
+        return;
+      }
+
+      const parsed = rows.map(rowToContact);
+      const valid = parsed.filter((c) => c.name || c.email);
+      if (valid.length === 0) {
+        error.textContent = "No contacts found. Check the first row has headers such as Contact name and Contact email.";
+        return;
+      }
+
+      if (form.mode.value === "replace") {
+        state.customers = [];
+        if (state.campaign) state.campaign.selected.clear();
+      }
+      let id = nextCustomerId();
+      valid.forEach((c) => {
+        const contact = { id: id++, ...c };
+        state.customers.push(contact);
+        addToCampaignIfEligible(contact);
+      });
+      saveCustomers();
+      dialog.close();
+      renderCustomerTable();
+
+      const skipped = parsed.length - valid.length;
+      showToast(`${valid.length} ${valid.length === 1 ? "contact" : "contacts"} uploaded${skipped ? `, ${skipped} empty ${skipped === 1 ? "row" : "rows"} skipped` : ""}`);
+    });
+  }
+
+  function showToast(message) {
+    const toast = document.createElement("div");
+    toast.className = "toast";
+    toast.setAttribute("role", "status");
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
   }
 
   function selectedContacts() {
@@ -369,7 +657,7 @@
           <article class="card email-card">
             <div class="email-meta">
               <span>To <strong>${esc(c.name)}</strong> &lt;${esc(c.email)}&gt;</span>
-              <span>${esc(c.role)}, ${esc(c.company)} <span class="chip">${esc(c.website)}</span></span>
+              <span>${esc([c.role, c.company].filter(Boolean).join(", "))} ${c.website ? `<span class="chip">${esc(c.website)}</span>` : ""}</span>
             </div>
             <div class="email-body">
               <p class="subject">${esc(email.subject)}</p>

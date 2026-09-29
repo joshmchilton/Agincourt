@@ -20,7 +20,7 @@ Then open http://localhost:8080.
 
 - **Qualified Leads**: coming soon.
 - **Campaign Builder**: one card per product. Upload product information, see the uploaded files and a generated description, then click **Generate Campaign**.
-- **Customer Database**: contacts with ticks for the products they buy. When a campaign is started, everyone who doesn't buy that product is preselected; adjust the selection and click **Continue**.
+- **Customer Database**: contacts with company website, employee count, industry, and ticks for the products they buy. Add contacts one at a time or upload an Excel/CSV file (a template is available from the upload dialog); contacts are saved in the browser. When a campaign is started, everyone who doesn't buy that product is preselected; adjust the selection and click **Continue**.
 - **Campaign preview**: a tailored message per selected contact, and **Approve and Launch Campaign**.
 
 ## Project layout
