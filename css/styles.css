@@ -362,3 +362,35 @@ td.row-actions { white-space: nowrap; text-align: right; }
 .research-notes .section-label { display: block; margin-bottom: 4px; }
 
 .template-note { background: #FAEEDA; border-color: #F0D9B0; color: #633806; }
+
+/* Manual product fields and adding products */
+.product-card-head { display: flex; align-items: center; gap: 8px; }
+.product-card-head .product-name { flex: 1; min-width: 0; }
+.field textarea {
+  font: inherit;
+  font-size: 14px;
+  color: var(--ink);
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--white);
+  resize: vertical;
+  line-height: 1.5;
+}
+.field textarea:focus { outline: none; border-color: var(--sage); }
+.add-product-card {
+  font: inherit;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 240px;
+  border: 1px dashed var(--grey-mark);
+  background: transparent;
+  color: var(--slate);
+  font-weight: 500;
+  cursor: pointer;
+}
+.add-product-card:hover { border-color: var(--slate); background: var(--white); }
+.add-product-plus { font-size: 28px; line-height: 1; color: var(--sage-dark); }

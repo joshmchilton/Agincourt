@@ -1,5 +1,5 @@
-// Agincourt server: serves the web app and generates product descriptions
-// with Claude. The API key stays here, never in the browser.
+// Agincourt server: serves the web app and writes campaign emails with
+// Claude. The API key stays here, never in the browser.
 
 import Anthropic from "@anthropic-ai/sdk";
 import express from "express";
@@ -14,14 +14,6 @@ const MODEL = "claude-opus-5";
 
 const hasCredentials = Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
 const client = hasCredentials ? new Anthropic() : null;
-
-const DESCRIBE_SYSTEM = `You write short product descriptions for a B2B campaign builder. Sales teams read them to understand a product at a glance before building a marketing campaign for it.
-
-From the product information provided, write 2 to 3 sentences (under 70 words) covering what the product does, who it is for, and the main benefit to that buyer. Write plain prose: no headings, bullet points, quotation marks, or superlatives such as "revolutionary" or "best-in-class". Use only facts found in the documents.
-
-If the documents don't contain enough information to describe the product, reply with one sentence saying what is missing.
-
-Reply with the description only.`;
 
 const TEXT_EXTENSIONS = /\.(txt|md|csv|html?|json)$/i;
 
@@ -138,51 +130,6 @@ app.get("/api/status", (req, res) => {
   res.json({ ai: hasCredentials });
 });
 
-app.post("/api/describe", async (req, res) => {
-  if (!client) {
-    return res.status(503).json({ error: "not_configured", message: "No Anthropic API key is set on the server." });
-  }
-
-  const files = Array.isArray(req.body?.files) ? req.body.files : [];
-  const productName = String(req.body?.productName || "this product");
-
-  const { blocks, skipped } = await toDocumentBlocks(files);
-  if (blocks.length === 0) {
-    return res.status(422).json({
-      error: "unsupported",
-      message: "None of the uploaded files could be read. Upload PDF, Word (.docx), or text files.",
-      skipped,
-    });
-  }
-
-  try {
-    const response = await client.beta.messages.create({
-      model: MODEL,
-      max_tokens: 16000,
-      output_config: { effort: "medium" },
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-      system: DESCRIBE_SYSTEM,
-      messages: [{
-        role: "user",
-        content: [...blocks, { type: "text", text: `Write the description for ${productName}.` }],
-      }],
-    });
-
-    if (response.stop_reason === "refusal") {
-      return res.status(422).json({ error: "refused", message: "A description couldn't be generated from these files." });
-    }
-    const description = response.content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("")
-      .trim();
-    res.json({ description, skipped });
-  } catch (err) {
-    sendApiError(res, err, "description");
-  }
-});
-
 // Stores a product's documents for the campaign that's about to run.
 app.post("/api/products/:id/documents", async (req, res) => {
   if (!client) {
@@ -287,6 +234,6 @@ app.get("/", (req, res) => res.sendFile(path.join(here, "index.html")));
 app.listen(PORT, () => {
   console.log(`Agincourt running at http://localhost:${PORT}`);
   if (!hasCredentials) {
-    console.log("No ANTHROPIC_API_KEY set: product descriptions will use the basic fallback. Add a key to .env to enable Claude.");
+    console.log("No ANTHROPIC_API_KEY set: campaign emails will use the basic template. Add a key to .env to enable Claude.");
   }
 });

@@ -3,18 +3,17 @@
 
   const data = window.AGINCOURT_DATA;
   const app = document.getElementById("app");
-  const NAMES_KEY = "agincourt.productNames";
+  const PRODUCTS_KEY = "agincourt.products";
+  const OLD_NAMES_KEY = "agincourt.productNames";
   const CUSTOMERS_KEY = "agincourt.opportunities";
 
   const state = {
-    products: data.products.map((p) => ({ ...p, pageUrl: "", files: [], description: "" })),
+    products: loadProducts(),
     customers: loadCustomers(),
     // Active campaign: { productId, selected: Set<customerId>, launched: bool }
     campaign: null,
     search: "",
   };
-
-  loadProductNames();
 
   // ---------- Helpers ----------
 
@@ -37,19 +36,35 @@
     return state.products.find((p) => p.id === id);
   }
 
-  // Saved per product as { name, pageUrl }; older saves hold just the name.
-  function loadProductNames() {
+  // Products are saved as [{ id, name, pageUrl, description }]. Uploaded
+  // files can't be saved in the browser, so they're re-uploaded per session.
+  function loadProducts() {
+    const withRuntime = (p) => ({ id: p.id, name: p.name, pageUrl: p.pageUrl || "", description: p.description || "", files: [] });
     try {
-      const saved = JSON.parse(localStorage.getItem(NAMES_KEY) || "{}");
-      state.products.forEach((p) => {
-        const entry = saved[p.id];
-        if (typeof entry === "string") p.name = entry;
-        else if (entry) {
-          if (entry.name) p.name = entry.name;
-          p.pageUrl = entry.pageUrl || "";
-        }
+      const saved = JSON.parse(localStorage.getItem(PRODUCTS_KEY));
+      if (Array.isArray(saved) && saved.length) return saved.map(withRuntime);
+      // Older saves held only names and page URLs for the starting products.
+      const old = JSON.parse(localStorage.getItem(OLD_NAMES_KEY) || "{}");
+      return data.products.map((p) => {
+        const entry = old[p.id];
+        if (typeof entry === "string") return withRuntime({ ...p, name: entry });
+        return withRuntime({ ...p, ...(entry || {}) });
       });
+    } catch (e) {
+      return data.products.map(withRuntime);
+    }
+  }
+
+  function saveProducts() {
+    try {
+      const products = state.products.map(({ id, name, pageUrl, description }) => ({ id, name, pageUrl, description }));
+      localStorage.setItem(PRODUCTS_KEY, JSON.stringify(products));
     } catch (e) { /* storage unavailable */ }
+  }
+
+  function nextProductId() {
+    const max = state.products.reduce((m, p) => Math.max(m, Number(p.id.slice(1)) || 0), 0);
+    return "p" + (max + 1);
   }
 
   function loadCustomers() {
@@ -80,21 +95,6 @@
     return /^https?:\/\//i.test(site) ? site : "https://" + site;
   }
 
-  function saveProductNames() {
-    try {
-      const names = {};
-      state.products.forEach((p) => { names[p.id] = { name: p.name, pageUrl: p.pageUrl || "" }; });
-      localStorage.setItem(NAMES_KEY, JSON.stringify(names));
-    } catch (e) { /* storage unavailable */ }
-  }
-
-  // ---------- Description generation ----------
-  // Uploaded files go to the server, which asks Claude for a description.
-  // If the server has no API key (or isn't running), a basic summary of any
-  // text files is used instead.
-
-  const TEXT_TYPES = /\.(txt|md|csv|html?|json)$/i;
-
   function readAsBase64(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -102,78 +102,6 @@
       reader.onerror = () => reject(reader.error);
       reader.readAsDataURL(file);
     });
-  }
-
-  async function describeProduct(p) {
-    const requestId = (p.requestId || 0) + 1;
-    p.requestId = requestId;
-    p.descriptionNote = "";
-
-    if (p.files.length === 0) {
-      p.description = "";
-      p.descriptionStatus = "idle";
-      return refreshCampaigns();
-    }
-
-    p.descriptionStatus = "generating";
-    refreshCampaigns();
-
-    let result;
-    try {
-      const files = await Promise.all(p.files.map(async (f) => ({
-        name: f.name,
-        type: f.file.type,
-        data: await readAsBase64(f.file),
-      })));
-      const res = await fetch("/api/describe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ productName: p.name, files }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (res.ok) result = { description: body.description, skipped: body.skipped || [] };
-      else if (res.status === 503 || res.status === 404 || res.status === 501) result = { fallback: true };
-      else result = { error: body.message || "The description couldn't be generated." };
-    } catch (e) {
-      result = { fallback: true };
-    }
-
-    if (p.requestId !== requestId) return; // a newer upload has taken over
-
-    if (result.fallback) {
-      p.description = await buildLocalDescription(p);
-      p.descriptionStatus = "fallback";
-      p.descriptionNote = p.description
-        ? "Basic summary. Connect Claude to generate descriptions from PDFs and Word files."
-        : "Connect Claude to generate a description from these files.";
-    } else if (result.error) {
-      p.descriptionStatus = "error";
-      p.descriptionNote = result.error;
-    } else {
-      p.description = result.description;
-      p.descriptionStatus = "done";
-      if (result.skipped.length) p.descriptionNote = `Couldn't read: ${result.skipped.join(", ")}.`;
-    }
-    refreshCampaigns();
-  }
-
-  function refreshCampaigns() {
-    if ((location.hash.replace("#", "") || "campaigns") === "campaigns") renderCampaigns();
-  }
-
-  async function buildLocalDescription(product) {
-    if (product.files.length === 0) return "";
-    const textFiles = product.files.filter((f) => TEXT_TYPES.test(f.name));
-    for (const f of textFiles) {
-      const text = (await f.file.text()).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-      if (text) {
-        const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-        let summary = sentences.slice(0, 2).join(" ").trim();
-        if (summary.length > 240) summary = summary.slice(0, 237).trimEnd() + "…";
-        return summary;
-      }
-    }
-    return "";
   }
 
   // ---------- Marketing content generation ----------
@@ -375,24 +303,34 @@
       <div class="page-head">
         <div>
           <h1>Campaign Builder</h1>
-          <p>Upload product information, then create a campaign for contacts who don't yet buy that product.</p>
+          <p>Add each product you want to promote, upload its information, then create a campaign for contacts who don't yet buy it.</p>
+        </div>
+        <div class="actions">
+          <button class="btn" id="add-product">Add product</button>
         </div>
       </div>
       <div class="product-grid">
         ${state.products.map(productCard).join("")}
+        <button class="card add-product-card" id="add-product-card">
+          <span class="add-product-plus" aria-hidden="true">+</span>
+          Add another product
+        </button>
       </div>`;
+
+    app.querySelector("#add-product").addEventListener("click", addProduct);
+    app.querySelector("#add-product-card").addEventListener("click", addProduct);
 
     app.querySelectorAll(".product-name").forEach((input) => {
       input.addEventListener("input", () => {
         productById(input.dataset.id).name = input.value;
-        saveProductNames();
+        saveProducts();
       });
       input.addEventListener("blur", () => {
         const p = productById(input.dataset.id);
         if (!p.name.trim()) {
-          p.name = data.products.find((d) => d.id === p.id).name;
+          p.name = `Product ${state.products.indexOf(p) + 1}`;
           input.value = p.name;
-          saveProductNames();
+          saveProducts();
         }
       });
     });
@@ -400,7 +338,14 @@
     app.querySelectorAll(".product-url").forEach((input) => {
       input.addEventListener("input", () => {
         productById(input.dataset.id).pageUrl = input.value.trim();
-        saveProductNames();
+        saveProducts();
+      });
+    });
+
+    app.querySelectorAll(".product-description").forEach((input) => {
+      input.addEventListener("input", () => {
+        productById(input.dataset.id).description = input.value;
+        saveProducts();
       });
     });
 
@@ -410,7 +355,7 @@
         Array.from(input.files).forEach((file) => {
           p.files.push({ name: file.name, size: file.size, file });
         });
-        describeProduct(p);
+        renderCampaigns();
       });
     });
 
@@ -418,13 +363,48 @@
       btn.addEventListener("click", () => {
         const p = productById(btn.dataset.id);
         p.files.splice(Number(btn.dataset.remove), 1);
-        describeProduct(p);
+        renderCampaigns();
       });
+    });
+
+    app.querySelectorAll("[data-remove-product]").forEach((btn) => {
+      btn.addEventListener("click", () => removeProduct(btn.dataset.removeProduct));
     });
 
     app.querySelectorAll("[data-generate]").forEach((btn) => {
       btn.addEventListener("click", () => startCampaign(btn.dataset.generate));
     });
+  }
+
+  function addProduct() {
+    const product = { id: nextProductId(), name: `Product ${state.products.length + 1}`, pageUrl: "", description: "", files: [] };
+    state.products.push(product);
+    saveProducts();
+    renderCampaigns();
+    const input = app.querySelector(`.product-name[data-id="${product.id}"]`);
+    if (input) {
+      input.scrollIntoView({ behavior: "smooth", block: "center" });
+      input.focus();
+      input.select();
+    }
+  }
+
+  // Removing a product also drops it from every contact's list of products.
+  function removeProduct(id) {
+    const product = productById(id);
+    if (!product) return;
+    if (state.products.length === 1) {
+      showToast("Keep at least one product");
+      return;
+    }
+    if (!confirm(`Remove ${product.name}? Its column will also be removed from the Opportunity Database.`)) return;
+    state.products = state.products.filter((p) => p.id !== id);
+    state.customers.forEach((c) => { c.products = c.products.filter((pid) => pid !== id); });
+    if (state.campaign && state.campaign.productId === id) state.campaign = null;
+    saveProducts();
+    saveCustomers();
+    renderCampaigns();
+    showToast(`${product.name} removed`);
   }
 
   function productCard(p) {
@@ -437,18 +417,12 @@
           </li>`).join("")}</ul>`
       : `<p class="empty-note" style="margin-top:10px">No product information uploaded yet.</p>`;
 
-    let description;
-    if (p.descriptionStatus === "generating") description = `<span class="generating">Generating description…</span>`;
-    else if (p.description) description = esc(p.description);
-    else if (!p.files.length) description = `<span class="empty-note">Upload product information to generate a description.</span>`;
-    else description = "";
-    if (p.descriptionNote && p.descriptionStatus !== "generating") {
-      description += `<span class="description-note ${p.descriptionStatus === "error" ? "is-error" : ""}">${esc(p.descriptionNote)}</span>`;
-    }
-
     return `
       <article class="card product-card">
-        <input class="product-name" data-id="${p.id}" value="${esc(p.name)}" aria-label="Product name">
+        <div class="product-card-head">
+          <input class="product-name" data-id="${p.id}" value="${esc(p.name)}" aria-label="Product name">
+          <button class="icon-btn" data-remove-product="${p.id}" aria-label="Remove ${esc(p.name)}" title="Remove product">×</button>
+        </div>
         <label class="field">
           <span class="section-label" style="margin-bottom:0">Product page</span>
           <input class="product-url" type="url" data-id="${p.id}" value="${esc(p.pageUrl || "")}" placeholder="https://example.com/product" aria-describedby="url-help-${p.id}">
@@ -462,10 +436,10 @@
           </label>
           ${files}
         </div>
-        <div>
-          <div class="section-label">Description</div>
-          <p class="description">${description}</p>
-        </div>
+        <label class="field">
+          <span class="section-label" style="margin-bottom:0">Description</span>
+          <textarea class="product-description" data-id="${p.id}" rows="4" placeholder="What the product does, who it's for, and the main benefit.">${esc(p.description || "")}</textarea>
+        </label>
         <button class="btn btn-primary btn-block" data-generate="${p.id}">Create Campaign</button>
       </article>`;
   }
