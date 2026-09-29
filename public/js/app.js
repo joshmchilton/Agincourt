@@ -274,9 +274,38 @@
     return value ? `<span class="mark yes" title="Yes">✓</span>` : `<span class="mark no" title="No">✕</span>`;
   }
 
-  // Most engaged first: total time on the email and the product page.
-  function engagedSeconds(lead) {
-    return lead.readSeconds + lead.websiteSeconds;
+  // Heat score, 0 to 100, from how strongly the lead engaged:
+  //   opened the email           20
+  //   time reading the email     up to 25 (full marks at 3 minutes)
+  //   clicked through            20
+  //   time on the website        up to 25 (full marks at 10 minutes)
+  //   how recently they opened   up to 10 (fading to 0 over 7 days)
+  const HEAT_PARTS = [
+    { label: "Opened the email", max: 20, score: () => 20 },
+    { label: "Time reading the email", max: 25, score: (l) => 25 * Math.min(l.readSeconds / 180, 1) },
+    { label: "Clicked through", max: 20, score: (l) => (l.clickedThrough ? 20 : 0) },
+    { label: "Time on the website", max: 25, score: (l) => (l.clickedThrough ? 25 * Math.min(l.websiteSeconds / 600, 1) : 0) },
+    {
+      label: "Opened recently",
+      max: 10,
+      score: (l) => {
+        const hours = l.openedAt ? (Date.now() - new Date(l.openedAt).getTime()) / 3600000 : Infinity;
+        return 10 * Math.max(0, 1 - hours / 168);
+      },
+    },
+  ];
+
+  function heat(lead) {
+    const parts = HEAT_PARTS.map((p) => ({ label: p.label, max: p.max, points: Math.round(p.score(lead)) }));
+    const score = Math.min(100, parts.reduce((sum, p) => sum + p.points, 0));
+    const level = score >= 70 ? "hot" : score >= 45 ? "warm" : "cool";
+    return { score, level, label: { hot: "Hot", warm: "Warm", cool: "Cool" }[level], parts };
+  }
+
+  function heatBadge(lead) {
+    const h = heat(lead);
+    const breakdown = h.parts.map((p) => `${p.label}: ${p.points}/${p.max}`).join("\n");
+    return `<span class="heat heat-${h.level}" title="${esc(`Heat score ${h.score}/100\n${breakdown}`)}"><span class="heat-score">${h.score}</span>${h.label}</span>`;
   }
 
   async function renderLeads() {
@@ -284,7 +313,7 @@
       <div class="page-head">
         <div>
           <h1>Qualified Leads</h1>
-          <p>Contacts who opened a campaign email, most engaged first. Select a lead to see their briefing.</p>
+          <p>Contacts who opened a campaign email, hottest first. Select a lead to see their briefing.</p>
         </div>
       </div>
       <p class="generating">Loading leads…</p>`;
@@ -314,15 +343,21 @@
         </div>
       </div>`).join("");
 
-    const leads = [...data.leads].sort((a, b) => engagedSeconds(b) - engagedSeconds(a));
+    const leads = [...data.leads].sort((a, b) => heat(b).score - heat(a).score);
     const table = leads.length ? `
+      <p class="heat-legend">
+        <strong>Heat score</strong> (0–100) combines opening the email, time spent reading it, clicking through, time on the website, and how recently they opened.
+        <span class="heat heat-hot"><span class="heat-score">70+</span>Hot</span>
+        <span class="heat heat-warm"><span class="heat-score">45+</span>Warm</span>
+        <span class="heat heat-cool"><span class="heat-score">&lt;45</span>Cool</span>
+      </p>
       <div class="table-wrap">
         <table class="leads-table">
           <thead>
             <tr>
+              <th>Heat score</th>
               <th>Contact</th>
-              <th>Company</th>
-              <th>Campaign</th>
+              <th>Company and campaign</th>
               <th class="center">Email opened</th>
               <th class="num">Time reading email</th>
               <th class="center">Clicked through</th>
@@ -333,9 +368,9 @@
           <tbody>
             ${leads.map((l) => `
               <tr class="lead-row" data-lead="${l.id}" tabindex="0">
+                <td>${heatBadge(l)}</td>
                 <td><a class="lead-link" href="#lead/${l.id}">${esc(l.contact.name)}</a><span class="sub">${esc(l.contact.role)}</span></td>
-                <td>${esc(l.contact.company)}</td>
-                <td>${esc(l.campaign.name)}</td>
+                <td>${esc(l.contact.company)}<span class="sub">${esc(l.campaign.name)}</span></td>
                 <td class="center">${yesNo(true)}</td>
                 <td class="num">${formatDuration(l.readSeconds)}</td>
                 <td class="center">${yesNo(l.clickedThrough)}</td>
@@ -354,7 +389,7 @@
       <div class="page-head">
         <div>
           <h1>Qualified Leads</h1>
-          <p>Contacts who opened a campaign email, most engaged first. Select a lead to see their briefing.</p>
+          <p>Contacts who opened a campaign email, hottest first. Select a lead to see their briefing.</p>
         </div>
       </div>
       ${summary ? `<div class="campaign-summaries">${summary}</div>` : ""}
@@ -391,6 +426,7 @@
     }
     const c = lead.contact;
     const product = productById(lead.campaign.productId);
+    const leadHeat = heat(lead);
 
     app.innerHTML = `
       <div class="page-head">
@@ -402,6 +438,21 @@
         <div class="actions">
           <button class="btn" id="rewrite-brief" hidden>Rewrite briefing</button>
         </div>
+      </div>
+
+      <div class="card heat-card heat-card-${leadHeat.level}">
+        <div>
+          <span class="metric-label">Heat score</span>
+          <div class="heat-card-score"><span class="metric-value">${leadHeat.score}</span><span class="heat heat-${leadHeat.level}">${leadHeat.label}</span></div>
+        </div>
+        <ul class="heat-breakdown">
+          ${leadHeat.parts.map((p) => `
+            <li>
+              <span>${esc(p.label)}</span>
+              <span class="heat-bar" aria-hidden="true"><span style="width:${Math.round((p.points / p.max) * 100)}%"></span></span>
+              <span class="heat-points">${p.points}/${p.max}</span>
+            </li>`).join("")}
+        </ul>
       </div>
 
       <div class="metrics lead-metrics">
