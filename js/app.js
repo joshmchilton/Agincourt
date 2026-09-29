@@ -1,15 +1,15 @@
 (function () {
   "use strict";
 
-  const data = window.AGINCOURT_DATA;
   const app = document.getElementById("app");
-  const PRODUCTS_KEY = "agincourt.products";
-  const OLD_NAMES_KEY = "agincourt.productNames";
-  const CUSTOMERS_KEY = "agincourt.opportunities";
 
+  // Everything is loaded from, and saved to, Supabase through the server.
   const state = {
-    products: loadProducts(),
-    customers: loadCustomers(),
+    loaded: false,
+    ai: false, // whether the server can write emails with Claude
+    // [{ id, name, pageUrl, description, documents: [{ id, name, size, type }] }]
+    products: [],
+    customers: [],
     // Active campaign: { productId, selected: Set<customerId>, launched: bool }
     campaign: null,
     search: "",
@@ -36,53 +36,46 @@
     return state.products.find((p) => p.id === id);
   }
 
-  // Products are saved as [{ id, name, pageUrl, description }]. Uploaded
-  // files can't be saved in the browser, so they're re-uploaded per session.
-  function loadProducts() {
-    const withRuntime = (p) => ({ id: p.id, name: p.name, pageUrl: p.pageUrl || "", description: p.description || "", files: [] });
-    try {
-      const saved = JSON.parse(localStorage.getItem(PRODUCTS_KEY));
-      if (Array.isArray(saved) && saved.length) return saved.map(withRuntime);
-      // Older saves held only names and page URLs for the starting products.
-      const old = JSON.parse(localStorage.getItem(OLD_NAMES_KEY) || "{}");
-      return data.products.map((p) => {
-        const entry = old[p.id];
-        if (typeof entry === "string") return withRuntime({ ...p, name: entry });
-        return withRuntime({ ...p, ...(entry || {}) });
-      });
-    } catch (e) {
-      return data.products.map(withRuntime);
+  // ---------- Server API ----------
+
+  async function api(method, url, body) {
+    const res = await fetch(url, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 204) return null;
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(data.message || "Something went wrong. Try again.");
+      err.status = res.status;
+      err.code = data.error;
+      throw err;
     }
+    return data;
   }
 
-  function saveProducts() {
-    try {
-      const products = state.products.map(({ id, name, pageUrl, description }) => ({ id, name, pageUrl, description }));
-      localStorage.setItem(PRODUCTS_KEY, JSON.stringify(products));
-    } catch (e) { /* storage unavailable */ }
+  function reportError(err) {
+    showToast(err.message || "Something went wrong. Try again.");
   }
 
-  function nextProductId() {
-    const max = state.products.reduce((m, p) => Math.max(m, Number(p.id.slice(1)) || 0), 0);
-    return "p" + (max + 1);
+  // Product fields save shortly after typing stops.
+  const pendingProductSaves = new Map();
+
+  function saveProductSoon(p) {
+    clearTimeout(pendingProductSaves.get(p.id));
+    pendingProductSaves.set(p.id, setTimeout(() => saveProductNow(p), 600));
   }
 
-  function loadCustomers() {
-    try {
-      const saved = JSON.parse(localStorage.getItem(CUSTOMERS_KEY));
-      if (Array.isArray(saved)) return saved;
-    } catch (e) { /* storage unavailable */ }
-    return data.customers.slice();
+  function saveProductNow(p) {
+    clearTimeout(pendingProductSaves.get(p.id));
+    pendingProductSaves.delete(p.id);
+    return api("PATCH", `/api/products/${p.id}`, { name: p.name, pageUrl: p.pageUrl, description: p.description })
+      .catch(reportError);
   }
 
-  function saveCustomers() {
-    try {
-      localStorage.setItem(CUSTOMERS_KEY, JSON.stringify(state.customers));
-    } catch (e) { /* storage unavailable */ }
-  }
-
-  function nextCustomerId() {
-    return state.customers.reduce((max, c) => Math.max(max, c.id), 0) + 1;
+  function flushProductSaves() {
+    return Promise.all([...pendingProductSaves.keys()].map((id) => saveProductNow(productById(id))));
   }
 
   function formatEmployees(value) {
@@ -160,21 +153,6 @@
     return { res, body: await res.json().catch(() => ({})) };
   }
 
-  async function syncProductDocuments(campaign, product) {
-    try {
-      const files = await Promise.all(product.files.map(async (f) => ({
-        name: f.name,
-        type: f.file.type,
-        data: await readAsBase64(f.file),
-      })));
-      const { res } = await postJson(`/api/products/${product.id}/documents`, { files });
-      if (res.ok) return "ai";
-      return "template"; // no API key on the server
-    } catch (e) {
-      return "template"; // server not reachable
-    }
-  }
-
   function contactForSkill(c) {
     const contact = {
       name: c.name,
@@ -194,18 +172,10 @@
     entry.status = "writing";
     updateEmailCard(contact.id);
 
-    const payload = {
-      productId: product.id,
-      product: { name: product.name, description: product.description, pageUrl: product.pageUrl },
-      contact: contactForSkill(contact),
-    };
+    // The server loads the product and its documents from Supabase.
+    const payload = { productId: product.id, contact: contactForSkill(contact) };
     try {
-      let { res, body } = await postJson("/api/campaign-email", payload);
-      if (res.status === 409) {
-        // Server restarted and lost the documents: send them again once.
-        await syncProductDocuments(campaign, product);
-        ({ res, body } = await postJson("/api/campaign-email", payload));
-      }
+      const { res, body } = await postJson("/api/campaign-email", payload);
       if (res.ok) {
         entry.status = "done";
         entry.email = body.email;
@@ -229,9 +199,7 @@
 
     let changed = false;
     if (!campaign.mode) {
-      campaign.mode = await syncProductDocuments(campaign, product);
-      if (state.campaign !== campaign) return;
-      if (location.hash === "#preview") renderPreview();
+      campaign.mode = state.ai ? "ai" : "template";
       changed = true;
     }
 
@@ -322,49 +290,42 @@
 
     app.querySelectorAll(".product-name").forEach((input) => {
       input.addEventListener("input", () => {
-        productById(input.dataset.id).name = input.value;
-        saveProducts();
+        const p = productById(input.dataset.id);
+        p.name = input.value;
+        if (p.name.trim()) saveProductSoon(p);
       });
       input.addEventListener("blur", () => {
         const p = productById(input.dataset.id);
         if (!p.name.trim()) {
           p.name = `Product ${state.products.indexOf(p) + 1}`;
           input.value = p.name;
-          saveProducts();
+          saveProductNow(p);
         }
       });
     });
 
     app.querySelectorAll(".product-url").forEach((input) => {
       input.addEventListener("input", () => {
-        productById(input.dataset.id).pageUrl = input.value.trim();
-        saveProducts();
+        const p = productById(input.dataset.id);
+        p.pageUrl = input.value.trim();
+        saveProductSoon(p);
       });
     });
 
     app.querySelectorAll(".product-description").forEach((input) => {
       input.addEventListener("input", () => {
-        productById(input.dataset.id).description = input.value;
-        saveProducts();
+        const p = productById(input.dataset.id);
+        p.description = input.value;
+        saveProductSoon(p);
       });
     });
 
     app.querySelectorAll("input[type=file]").forEach((input) => {
-      input.addEventListener("change", () => {
-        const p = productById(input.dataset.id);
-        Array.from(input.files).forEach((file) => {
-          p.files.push({ name: file.name, size: file.size, file });
-        });
-        renderCampaigns();
-      });
+      input.addEventListener("change", () => uploadDocuments(productById(input.dataset.id), Array.from(input.files)));
     });
 
     app.querySelectorAll("[data-remove]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const p = productById(btn.dataset.id);
-        p.files.splice(Number(btn.dataset.remove), 1);
-        renderCampaigns();
-      });
+      btn.addEventListener("click", () => removeDocument(productById(btn.dataset.id), btn.dataset.remove));
     });
 
     app.querySelectorAll("[data-remove-product]").forEach((btn) => {
@@ -376,10 +337,49 @@
     });
   }
 
-  function addProduct() {
-    const product = { id: nextProductId(), name: `Product ${state.products.length + 1}`, pageUrl: "", description: "", files: [] };
+  async function uploadDocuments(p, files) {
+    if (!files.length) return;
+    p.uploading = (p.uploading || 0) + files.length;
+    renderCampaigns();
+    try {
+      const payload = await Promise.all(files.map(async (file) => ({
+        name: file.name,
+        type: file.type,
+        data: await readAsBase64(file),
+      })));
+      const added = await api("POST", `/api/products/${p.id}/documents`, { files: payload });
+      p.documents.push(...added);
+    } catch (err) {
+      reportError(err);
+    }
+    p.uploading -= files.length;
+    refreshCampaigns();
+  }
+
+  async function removeDocument(p, documentId) {
+    const doc = p.documents.find((d) => d.id === documentId);
+    if (!doc || !confirm(`Remove ${doc.name} from ${p.name}?`)) return;
+    try {
+      await api("DELETE", `/api/products/${p.id}/documents/${documentId}`);
+      p.documents = p.documents.filter((d) => d.id !== documentId);
+      refreshCampaigns();
+    } catch (err) {
+      reportError(err);
+    }
+  }
+
+  function refreshCampaigns() {
+    if ((location.hash.replace("#", "") || "campaigns") === "campaigns") renderCampaigns();
+  }
+
+  async function addProduct() {
+    let product;
+    try {
+      product = await api("POST", "/api/products");
+    } catch (err) {
+      return reportError(err);
+    }
     state.products.push(product);
-    saveProducts();
     renderCampaigns();
     const input = app.querySelector(`.product-name[data-id="${product.id}"]`);
     if (input) {
@@ -390,32 +390,37 @@
   }
 
   // Removing a product also drops it from every contact's list of products.
-  function removeProduct(id) {
+  async function removeProduct(id) {
     const product = productById(id);
     if (!product) return;
     if (state.products.length === 1) {
       showToast("Keep at least one product");
       return;
     }
-    if (!confirm(`Remove ${product.name}? Its column will also be removed from the Opportunity Database.`)) return;
+    if (!confirm(`Remove ${product.name}? Its documents and its column in the Opportunity Database will also be removed.`)) return;
+    try {
+      await api("DELETE", `/api/products/${id}`);
+    } catch (err) {
+      return reportError(err);
+    }
     state.products = state.products.filter((p) => p.id !== id);
     state.customers.forEach((c) => { c.products = c.products.filter((pid) => pid !== id); });
     if (state.campaign && state.campaign.productId === id) state.campaign = null;
-    saveProducts();
-    saveCustomers();
     renderCampaigns();
     showToast(`${product.name} removed`);
   }
 
   function productCard(p) {
-    const files = p.files.length
-      ? `<ul class="file-list">${p.files.map((f, i) => `
+    const docs = p.documents || [];
+    let files = docs.length
+      ? `<ul class="file-list">${docs.map((f) => `
           <li>
             <span class="file-name" title="${esc(f.name)}">${esc(f.name)}</span>
             <span class="file-size">${formatSize(f.size)}</span>
-            <button class="icon-btn" data-id="${p.id}" data-remove="${i}" aria-label="Remove ${esc(f.name)}">×</button>
+            <button class="icon-btn" data-id="${p.id}" data-remove="${esc(f.id)}" aria-label="Remove ${esc(f.name)}">×</button>
           </li>`).join("")}</ul>`
-      : `<p class="empty-note" style="margin-top:10px">No product information uploaded yet.</p>`;
+      : (p.uploading ? "" : `<p class="empty-note" style="margin-top:10px">No product information uploaded yet.</p>`);
+    if (p.uploading) files += `<p class="generating" style="margin-top:10px">Uploading…</p>`;
 
     return `
       <article class="card product-card">
@@ -444,7 +449,9 @@
       </article>`;
   }
 
-  function startCampaign(productId) {
+  async function startCampaign(productId) {
+    // The server reads the product's description and page from Supabase.
+    await flushProductSaves();
     const selected = new Set(
       state.customers.filter((c) => !c.products.includes(productId)).map((c) => c.id)
     );
@@ -682,7 +689,7 @@
     dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
     form.addEventListener("input", () => { error.textContent = ""; });
 
-    form.addEventListener("submit", (e) => {
+    form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const values = Object.fromEntries(new FormData(form));
       const name = (values.name || "").trim();
@@ -703,27 +710,39 @@
       };
 
       const existing = editingId != null && state.customers.find((c) => c.id === editingId);
-      if (existing) {
-        Object.assign(existing, fields);
-      } else {
-        const contact = { id: nextCustomerId(), ...fields };
-        state.customers.push(contact);
-        addToCampaignIfEligible(contact);
+      const submit = dialog.querySelector("#contact-form-submit");
+      submit.disabled = true;
+      try {
+        if (existing) {
+          Object.assign(existing, await api("PATCH", `/api/contacts/${existing.id}`, fields));
+        } else {
+          const contact = await api("POST", "/api/contacts", fields);
+          state.customers.push(contact);
+          addToCampaignIfEligible(contact);
+        }
+      } catch (err) {
+        error.textContent = err.message;
+        return;
+      } finally {
+        submit.disabled = false;
       }
-      saveCustomers();
       dialog.close();
       renderCustomerTable();
       if (existing) showToast("Contact updated");
     });
   }
 
-  function deleteContact(id) {
+  async function deleteContact(id) {
     const contact = state.customers.find((c) => c.id === id);
     if (!contact) return;
     if (!confirm(`Delete ${contact.name || contact.email}? This can't be undone.`)) return;
+    try {
+      await api("DELETE", `/api/contacts/${id}`);
+    } catch (err) {
+      return reportError(err);
+    }
     state.customers = state.customers.filter((c) => c.id !== id);
     if (state.campaign) state.campaign.selected.delete(id);
-    saveCustomers();
     renderCustomerTable();
     showToast("Contact deleted");
   }
@@ -860,17 +879,21 @@
         return;
       }
 
+      let saved;
+      try {
+        saved = await api("POST", "/api/contacts/import", { contacts: valid, mode: form.mode.value });
+      } catch (err) {
+        error.textContent = err.message;
+        return;
+      }
       if (form.mode.value === "replace") {
         state.customers = [];
         if (state.campaign) state.campaign.selected.clear();
       }
-      let id = nextCustomerId();
-      valid.forEach((c) => {
-        const contact = { id: id++, ...c };
+      saved.forEach((contact) => {
         state.customers.push(contact);
         addToCampaignIfEligible(contact);
       });
-      saveCustomers();
       dialog.close();
       renderCustomerTable();
 
@@ -905,7 +928,7 @@
 
     let intro;
     if (!campaign.mode) intro = "Preparing the product information…";
-    else if (campaign.mode === "template") intro = `Sample content for ${contacts.length} ${contacts.length === 1 ? "contact" : "contacts"}. Connect Claude (add an API key on the server) to write each email from the product documents, the company's website, and the contact's record.`;
+    else if (campaign.mode === "template") intro = `Sample content for ${contacts.length} ${contacts.length === 1 ? "contact" : "contacts"}. Connect Claude on the server (an API key, or npm run start:local for testing) to write each email from the product documents, the company's website, and the contact's record.`;
     else intro = `Each email is written by Claude from the product documents, the company's website, and the contact's record. <strong id="email-progress">${progressText(counts, contacts.length)}</strong>.`;
 
     app.innerHTML = `
@@ -989,7 +1012,7 @@
           </div>` : ""}
         ${entry.template ? `
           <div class="research-notes template-note">
-            Basic template, not written by Claude: no website review or ROI example. Add an API key on the server to use the campaign email skill.
+            Basic template, not written by Claude: no website review or ROI example. Connect Claude on the server (an API key, or npm run start:local for testing) to use the campaign email skill.
           </div>` : ""}`;
     } else if (entry.status === "error") {
       body = `<p class="description-note is-error">${esc(entry.error)}</p>
@@ -1055,6 +1078,29 @@
     window.scrollTo(0, 0);
   }
 
-  window.addEventListener("hashchange", route);
-  route();
+  async function boot() {
+    app.innerHTML = `<p class="generating">Loading…</p>`;
+    try {
+      const [status, data] = await Promise.all([api("GET", "/api/status"), api("GET", "/api/state")]);
+      state.ai = Boolean(status.ai);
+      state.products = data.products;
+      state.customers = data.contacts;
+      state.loaded = true;
+    } catch (err) {
+      app.innerHTML = `
+        <div class="page-head">
+          <div>
+            <h1>Your data couldn't be loaded</h1>
+            <p>${esc(err.message || "The server couldn't be reached.")}</p>
+          </div>
+          <div class="actions"><button class="btn btn-primary" id="retry-load">Try again</button></div>
+        </div>`;
+      app.querySelector("#retry-load").addEventListener("click", boot);
+      return;
+    }
+    route();
+  }
+
+  window.addEventListener("hashchange", () => { if (state.loaded) route(); });
+  boot();
 })();

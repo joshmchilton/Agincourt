@@ -1,19 +1,32 @@
 // Agincourt server: serves the web app and writes campaign emails with
 // Claude. The API key stays here, never in the browser.
+//
+// Two ways to reach Claude:
+//   npm start            uses ANTHROPIC_API_KEY from .env (the Claude API)
+//   npm run start:local  uses this machine's Claude Code sign-in, for the
+//                        developer's own testing (see subscription-engine.js)
 
 import Anthropic from "@anthropic-ai/sdk";
 import express from "express";
 import mammoth from "mammoth";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import * as db from "./db.js";
+import { NotSignedInError, writeEmailWithSubscription } from "./subscription-engine.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 8080;
 const MODEL = "claude-opus-5";
 
 const hasCredentials = Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
-const client = hasCredentials ? new Anthropic() : null;
+const ENGINE = process.argv.includes("--subscription") ? "subscription" : hasCredentials ? "api" : null;
+const client = ENGINE === "api" ? new Anthropic() : null;
+
+// In subscription mode, product documents are saved here so Claude Code can
+// read them. The folder is ignored by git.
+const CACHE_DIR = path.join(here, ".agincourt-cache", "products");
+const NOT_CONFIGURED = { error: "not_configured", message: "Claude isn't connected on the server." };
 
 const TEXT_EXTENSIONS = /\.(txt|md|csv|html?|json)$/i;
 
@@ -100,8 +113,8 @@ const EMAIL_SCHEMA = {
   additionalProperties: false,
 };
 
-// Product documents, kept in memory per product so each contact's request
-// reuses them (and the prompt cache) instead of re-uploading.
+// Product documents, loaded from Supabase and kept in memory per product so
+// each contact's request reuses them (and the prompt cache).
 const productDocs = new Map();
 
 function companyUrl(site) {
@@ -127,38 +140,159 @@ const app = express();
 app.use(express.json({ limit: "40mb" }));
 
 app.get("/api/status", (req, res) => {
-  res.json({ ai: hasCredentials });
+  res.json({ ai: Boolean(ENGINE), engine: ENGINE, database: db.dbConfigured });
 });
 
-// Stores a product's documents for the campaign that's about to run.
-app.post("/api/products/:id/documents", async (req, res) => {
-  if (!client) {
-    return res.status(503).json({ error: "not_configured", message: "No Anthropic API key is set on the server." });
-  }
+// ---------- Data routes (Supabase) ----------
+
+const DB_NOT_CONFIGURED = {
+  error: "db_not_configured",
+  message: "The database isn't connected. Add SUPABASE_URL and SUPABASE_SECRET_KEY to .env and restart the server.",
+};
+
+// Wraps a data route: checks the database is configured and turns thrown
+// errors into a JSON response.
+function dataRoute(handler) {
+  return async (req, res) => {
+    if (!db.dbConfigured) return res.status(503).json(DB_NOT_CONFIGURED);
+    try {
+      await handler(req, res);
+    } catch (err) {
+      console.error(`${req.method} ${req.path} failed:`, err.message || err);
+      res.status(500).json({ error: "db_error", message: "Your change couldn't be saved. Try again." });
+    }
+  };
+}
+
+const validProductId = (id) => /^p\d+$/.test(id);
+const validContactId = (id) => /^\d+$/.test(id);
+
+app.get("/api/state", dataRoute(async (req, res) => {
+  res.json(await db.loadState());
+}));
+
+app.post("/api/products", dataRoute(async (req, res) => {
+  res.status(201).json(await db.createProduct());
+}));
+
+app.patch("/api/products/:id", dataRoute(async (req, res) => {
+  if (!validProductId(req.params.id)) return res.status(400).json({ error: "bad_product", message: "Unknown product." });
+  const product = await db.updateProduct(req.params.id, req.body || {});
+  if (!product) return res.status(404).json({ error: "not_found", message: "That product no longer exists." });
+  res.json(product);
+}));
+
+app.delete("/api/products/:id", dataRoute(async (req, res) => {
+  if (!validProductId(req.params.id)) return res.status(400).json({ error: "bad_product", message: "Unknown product." });
+  await db.deleteProduct(req.params.id);
+  productDocs.delete(req.params.id);
+  res.status(204).end();
+}));
+
+app.post("/api/products/:id/documents", dataRoute(async (req, res) => {
+  if (!validProductId(req.params.id)) return res.status(400).json({ error: "bad_product", message: "Unknown product." });
   const files = Array.isArray(req.body?.files) ? req.body.files : [];
-  const { blocks, skipped } = await toDocumentBlocks(files);
-  productDocs.set(req.params.id, blocks);
-  res.json({ documents: blocks.length, skipped });
-});
+  res.status(201).json(await db.addDocuments(req.params.id, files));
+}));
+
+app.delete("/api/products/:id/documents/:docId", dataRoute(async (req, res) => {
+  if (!validProductId(req.params.id)) return res.status(400).json({ error: "bad_product", message: "Unknown product." });
+  await db.deleteDocument(req.params.id, req.params.docId);
+  res.status(204).end();
+}));
+
+app.post("/api/contacts", dataRoute(async (req, res) => {
+  res.status(201).json(await db.createContact(req.body || {}));
+}));
+
+app.patch("/api/contacts/:id", dataRoute(async (req, res) => {
+  if (!validContactId(req.params.id)) return res.status(400).json({ error: "bad_contact", message: "Unknown contact." });
+  const contact = await db.updateContact(Number(req.params.id), req.body || {});
+  if (!contact) return res.status(404).json({ error: "not_found", message: "That contact no longer exists." });
+  res.json(contact);
+}));
+
+app.delete("/api/contacts/:id", dataRoute(async (req, res) => {
+  if (!validContactId(req.params.id)) return res.status(400).json({ error: "bad_contact", message: "Unknown contact." });
+  await db.deleteContact(Number(req.params.id));
+  res.status(204).end();
+}));
+
+app.post("/api/contacts/import", dataRoute(async (req, res) => {
+  const contacts = Array.isArray(req.body?.contacts) ? req.body.contacts : [];
+  const mode = req.body?.mode === "replace" ? "replace" : "add";
+  res.status(201).json(await db.importContacts(contacts, mode));
+}));
+
+// ---------- Campaign emails ----------
+
+// Loads a product's documents from Supabase once per set of documents, and
+// in subscription mode also saves them to disk for Claude Code to read.
+function productContext(product) {
+  const signature = product.documents.map((d) => d.id).join(",");
+  const cached = productDocs.get(product.id);
+  if (cached && cached.signature === signature) return cached.promise;
+
+  const promise = (async () => {
+    const files = await db.downloadDocuments(product.id);
+    const { blocks } = await toDocumentBlocks(files);
+    let dir = null;
+    let fileNames = [];
+    if (ENGINE === "subscription") {
+      dir = path.join(CACHE_DIR, product.id);
+      await rm(dir, { recursive: true, force: true });
+      await mkdir(dir, { recursive: true });
+      fileNames = await saveDocuments(dir, blocks);
+    }
+    return { blocks, dir, fileNames };
+  })();
+  promise.catch(() => productDocs.delete(product.id));
+  productDocs.set(product.id, { signature, promise });
+  return promise;
+}
+
+// Writes document blocks to disk as PDF or text files for Claude Code to read.
+async function saveDocuments(dir, blocks) {
+  const names = [];
+  for (const [i, block] of blocks.entries()) {
+    const base = `${i + 1}-${String(block.title).replace(/[^\w.-]+/g, "_")}`;
+    if (block.source.type === "base64") {
+      const name = /\.pdf$/i.test(base) ? base : `${base}.pdf`;
+      await writeFile(path.join(dir, name), Buffer.from(block.source.data, "base64"));
+      names.push(name);
+    } else {
+      const name = `${base.replace(/\.[^.]+$/, "")}.txt`;
+      await writeFile(path.join(dir, name), block.source.data, "utf8");
+      names.push(name);
+    }
+  }
+  return names;
+}
 
 // Writes one contact's email using the campaign-email skill.
 app.post("/api/campaign-email", async (req, res) => {
-  if (!client) {
-    return res.status(503).json({ error: "not_configured", message: "No Anthropic API key is set on the server." });
-  }
+  if (!ENGINE) return res.status(503).json(NOT_CONFIGURED);
+
+  if (!db.dbConfigured) return res.status(503).json(DB_NOT_CONFIGURED);
 
   const productId = String(req.body?.productId || "");
-  const product = req.body?.product || {};
   const contact = req.body?.contact || {};
-  const docs = productDocs.get(productId);
-  if (!docs) {
-    return res.status(409).json({ error: "no_documents", message: "Product documents haven't been sent for this campaign." });
+  let product;
+  let stored;
+  try {
+    product = validProductId(productId) ? await db.getProduct(productId) : null;
+    if (!product) return res.status(404).json({ error: "not_found", message: "That product no longer exists." });
+    stored = await productContext(product);
+  } catch (err) {
+    console.error("Couldn't load product documents:", err.message || err);
+    return res.status(500).json({ error: "db_error", message: "The product documents couldn't be loaded. Try again." });
   }
+  const docs = stored.blocks;
   if (docs.length === 0 && !product.description) {
     return res.status(422).json({ error: "no_product_info", message: "Upload product information before creating a campaign." });
   }
 
-  const site = companyUrl(contact.website);
+  const site = companyUrl(contact.company_website || contact.website);
   const productText = [
     `Product name: ${product.name || "(not given)"}`,
     `Product description: ${product.description || "(not given)"}`,
@@ -179,6 +313,37 @@ app.post("/api/campaign-email", async (req, res) => {
     "",
     site ? `Company website: ${site.href}` : "No company website is recorded for this contact.",
   ].join("\n");
+
+  if (ENGINE === "subscription") {
+    const productLines = [
+      `Product name: ${product.name || "(not given)"}`,
+      `Product description: ${product.description || "(not given)"}`,
+      `Product page URL: ${product.pageUrl || "(not given)"}`,
+    ];
+    const docList = stored.fileNames.length
+      ? `The product documentation is in these files in your working directory. Read all of them before writing:\n${stored.fileNames.map((n) => `- ${n}`).join("\n")}`
+      : "No product documentation was uploaded; rely on the description.";
+    const prompt = [...productLines, "", docList, "", contactText].join("\n");
+    try {
+      const { email, fetchedWebsite } = await writeEmailWithSubscription({
+        system: await loadSkill(),
+        prompt,
+        cwd: stored.dir,
+        siteHost: site ? site.hostname.replace(/^www\./, "") : null,
+        schema: EMAIL_SCHEMA,
+      });
+      if (!email || !email.subject) {
+        return res.status(502).json({ error: "bad_output", message: "Claude's reply couldn't be read. Try again." });
+      }
+      return res.json({ email, fetchedWebsite });
+    } catch (err) {
+      if (err instanceof NotSignedInError) {
+        return res.status(503).json({ error: "not_signed_in", message: "Claude Code isn't signed in on this machine. Run: npm run login" });
+      }
+      console.error(err);
+      return res.status(502).json({ error: "subscription_error", message: "Claude couldn't write this email. Try again." });
+    }
+  }
 
   const tools = site
     ? [{
@@ -233,7 +398,9 @@ app.get("/", (req, res) => res.sendFile(path.join(here, "index.html")));
 
 app.listen(PORT, () => {
   console.log(`Agincourt running at http://localhost:${PORT}`);
-  if (!hasCredentials) {
-    console.log("No ANTHROPIC_API_KEY set: campaign emails will use the basic template. Add a key to .env to enable Claude.");
+  if (ENGINE === "subscription") {
+    console.log("Using this machine's Claude Code sign-in (local testing only). If emails fail, run: npm run login");
+  } else if (!ENGINE) {
+    console.log("No ANTHROPIC_API_KEY set: campaign emails will use the basic template. Add a key to .env, or run npm run start:local to test with your Claude subscription.");
   }
 });

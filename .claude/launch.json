@@ -6,6 +6,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["start"],
       "port": 8080
+    },
+    {
+      "name": "agincourt-local",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "start:local"],
+      "port": 8080
     }
   ]
 }
