@@ -7,7 +7,7 @@
   const CUSTOMERS_KEY = "agincourt.opportunities";
 
   const state = {
-    products: data.products.map((p) => ({ ...p, files: [], description: "" })),
+    products: data.products.map((p) => ({ ...p, pageUrl: "", files: [], description: "" })),
     customers: loadCustomers(),
     // Active campaign: { productId, selected: Set<customerId>, launched: bool }
     campaign: null,
@@ -37,10 +37,18 @@
     return state.products.find((p) => p.id === id);
   }
 
+  // Saved per product as { name, pageUrl }; older saves hold just the name.
   function loadProductNames() {
     try {
       const saved = JSON.parse(localStorage.getItem(NAMES_KEY) || "{}");
-      state.products.forEach((p) => { if (saved[p.id]) p.name = saved[p.id]; });
+      state.products.forEach((p) => {
+        const entry = saved[p.id];
+        if (typeof entry === "string") p.name = entry;
+        else if (entry) {
+          if (entry.name) p.name = entry.name;
+          p.pageUrl = entry.pageUrl || "";
+        }
+      });
     } catch (e) { /* storage unavailable */ }
   }
 
@@ -75,7 +83,7 @@
   function saveProductNames() {
     try {
       const names = {};
-      state.products.forEach((p) => { names[p.id] = p.name; });
+      state.products.forEach((p) => { names[p.id] = { name: p.name, pageUrl: p.pageUrl || "" }; });
       localStorage.setItem(NAMES_KEY, JSON.stringify(names));
     } catch (e) { /* storage unavailable */ }
   }
@@ -169,8 +177,9 @@
   }
 
   // ---------- Marketing content generation ----------
-  // Placeholder template. The campaign skill will replace this with content
-  // written from the product documentation, company website and job role.
+  // Emails are written by the campaign-email skill on the server
+  // (skills/campaign-email/SKILL.md). This template is only used when the
+  // server has no Anthropic API key.
 
   function roleAngle(role) {
     if (/financ|CFO|controller|procurement/i.test(role)) return "keeping costs predictable and proving the return on every investment matters";
@@ -181,7 +190,7 @@
     return "making day-to-day work simpler matters";
   }
 
-  function generateEmail(contact, product) {
+  function templateEmail(contact, product) {
     const first = (contact.name || "").split(" ")[0] || "there";
     const role = contact.role || "";
     const company = contact.company || "your team";
@@ -189,17 +198,159 @@
       ? `${product.name} is built for exactly that. ${product.description}`
       : `${product.name} is built to help with exactly that.`;
     const opener = role
-      ? `I've been looking at what ${company} is working on, and as ${role} I imagine ${roleAngle(role)} to you.`
-      : `I've been looking at what ${company} is working on, and I imagine ${roleAngle(role)} to you.`;
+      ? `As ${role} at ${company}, I imagine ${roleAngle(role)} to you.`
+      : `I imagine ${roleAngle(role)} to ${company}.`;
     return {
       subject: contact.company ? `${product.name} for ${contact.company}` : product.name,
-      paragraphs: [
-        `Hi ${first},`,
-        opener,
-        productLine,
-        `Would a 20-minute call next week be useful to see how it would fit ${company}?`,
-      ],
+      greeting: `Hi ${first},`,
+      paragraphs: [opener, productLine],
+      learn_more_url: product.pageUrl || "",
+      call_to_action: `Would a 15-minute call next week be useful to see how it would fit ${company}?`,
+      research_notes: "",
     };
+  }
+
+  function emailPlainText(email) {
+    const parts = [email.greeting, ...email.paragraphs];
+    if (email.learn_more_url) parts.push(`Learn more: ${email.learn_more_url}`);
+    parts.push(email.call_to_action);
+    return parts.filter(Boolean).join("\n\n");
+  }
+
+  // ---------- Campaign email writing ----------
+  // Sends the product's documents to the server once, then asks the skill
+  // for each selected contact's email, a few at a time.
+
+  const EMAIL_CONCURRENCY = 4;
+
+  async function postJson(url, body) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { res, body: await res.json().catch(() => ({})) };
+  }
+
+  async function syncProductDocuments(campaign, product) {
+    try {
+      const files = await Promise.all(product.files.map(async (f) => ({
+        name: f.name,
+        type: f.file.type,
+        data: await readAsBase64(f.file),
+      })));
+      const { res } = await postJson(`/api/products/${product.id}/documents`, { files });
+      if (res.ok) return "ai";
+      return "template"; // no API key on the server
+    } catch (e) {
+      return "template"; // server not reachable
+    }
+  }
+
+  function contactForSkill(c) {
+    const contact = {
+      name: c.name,
+      job_role: c.role,
+      company: c.company,
+      company_website: c.website,
+      employees: c.employees,
+      industry: c.industry,
+      buys_from_seller: c.products.map((id) => productById(id)?.name).filter(Boolean),
+    };
+    if (c.extra && Object.keys(c.extra).length) contact.additional_information = c.extra;
+    return contact;
+  }
+
+  async function writeEmail(campaign, product, contact) {
+    const entry = campaign.emails.get(contact.id);
+    entry.status = "writing";
+    updateEmailCard(contact.id);
+
+    const payload = {
+      productId: product.id,
+      product: { name: product.name, description: product.description, pageUrl: product.pageUrl },
+      contact: contactForSkill(contact),
+    };
+    try {
+      let { res, body } = await postJson("/api/campaign-email", payload);
+      if (res.status === 409) {
+        // Server restarted and lost the documents: send them again once.
+        await syncProductDocuments(campaign, product);
+        ({ res, body } = await postJson("/api/campaign-email", payload));
+      }
+      if (res.ok) {
+        entry.status = "done";
+        entry.email = body.email;
+        entry.fetchedWebsite = body.fetchedWebsite;
+      } else {
+        entry.status = "error";
+        entry.error = body.message || "This email couldn't be written.";
+      }
+    } catch (e) {
+      entry.status = "error";
+      entry.error = "The server couldn't be reached.";
+    }
+    updateEmailCard(contact.id);
+  }
+
+  async function runEmailWriting() {
+    const campaign = state.campaign;
+    if (!campaign || campaign.running) return;
+    campaign.running = true;
+    const product = productById(campaign.productId);
+
+    let changed = false;
+    if (!campaign.mode) {
+      campaign.mode = await syncProductDocuments(campaign, product);
+      if (state.campaign !== campaign) return;
+      if (location.hash === "#preview") renderPreview();
+      changed = true;
+    }
+
+    const queue = selectedContacts().filter((c) => {
+      const entry = campaign.emails.get(c.id);
+      return !entry || entry.status === "pending";
+    });
+    if (queue.length) changed = true;
+    queue.forEach((c) => {
+      if (campaign.mode === "template") {
+        campaign.emails.set(c.id, { status: "done", email: templateEmail(c, product), template: true });
+      } else if (!campaign.emails.has(c.id)) {
+        campaign.emails.set(c.id, { status: "pending" });
+      }
+    });
+
+    if (campaign.mode === "ai") {
+      const worker = async () => {
+        while (queue.length && state.campaign === campaign) {
+          await writeEmail(campaign, product, queue.shift());
+        }
+      };
+      await Promise.all(Array.from({ length: EMAIL_CONCURRENCY }, worker));
+    }
+    campaign.running = false;
+    // Re-render only when this run did something, or renderPreview (which
+    // starts a run) would loop.
+    if (changed && location.hash === "#preview" && state.campaign === campaign) renderPreview();
+  }
+
+  function progressText(counts, total) {
+    return `${counts.done} of ${total} written${counts.error ? `, ${counts.error} failed` : ""}`;
+  }
+
+  function safeUrl(url) {
+    return /^https?:\/\//i.test(String(url || "")) ? url : "";
+  }
+
+  function emailCounts(campaign, contacts) {
+    const counts = { done: 0, error: 0, waiting: 0 };
+    contacts.forEach((c) => {
+      const status = campaign.emails.get(c.id)?.status;
+      if (status === "done") counts.done++;
+      else if (status === "error") counts.error++;
+      else counts.waiting++;
+    });
+    return counts;
   }
 
   // ---------- Views ----------
@@ -224,7 +375,7 @@
       <div class="page-head">
         <div>
           <h1>Campaign Builder</h1>
-          <p>Upload product information, then generate a campaign for contacts who don't yet buy that product.</p>
+          <p>Upload product information, then create a campaign for contacts who don't yet buy that product.</p>
         </div>
       </div>
       <div class="product-grid">
@@ -243,6 +394,13 @@
           input.value = p.name;
           saveProductNames();
         }
+      });
+    });
+
+    app.querySelectorAll(".product-url").forEach((input) => {
+      input.addEventListener("input", () => {
+        productById(input.dataset.id).pageUrl = input.value.trim();
+        saveProductNames();
       });
     });
 
@@ -291,6 +449,11 @@
     return `
       <article class="card product-card">
         <input class="product-name" data-id="${p.id}" value="${esc(p.name)}" aria-label="Product name">
+        <label class="field">
+          <span class="section-label" style="margin-bottom:0">Product page</span>
+          <input class="product-url" type="url" data-id="${p.id}" value="${esc(p.pageUrl || "")}" placeholder="https://example.com/product" aria-describedby="url-help-${p.id}">
+          <span class="empty-note" id="url-help-${p.id}">Used for the "Learn more" link in campaign emails.</span>
+        </label>
         <div>
           <div class="section-label">Product information</div>
           <label class="btn btn-block" style="display:block;text-align:center">
@@ -303,7 +466,7 @@
           <div class="section-label">Description</div>
           <p class="description">${description}</p>
         </div>
-        <button class="btn btn-primary btn-block" data-generate="${p.id}">Generate Campaign</button>
+        <button class="btn btn-primary btn-block" data-generate="${p.id}">Create Campaign</button>
       </article>`;
   }
 
@@ -311,7 +474,9 @@
     const selected = new Set(
       state.customers.filter((c) => !c.products.includes(productId)).map((c) => c.id)
     );
-    state.campaign = { productId, selected, launched: false };
+    // emails: contactId -> { status: pending|writing|done|error, email, error }
+    // mode: "ai" once documents reach the server, "template" without an API key
+    state.campaign = { productId, selected, launched: false, emails: new Map(), mode: null, running: false };
     state.search = "";
     location.hash = "#opportunities";
   }
@@ -621,15 +786,23 @@
       return alias ? String(byHeader[alias]).trim() : "";
     };
 
+    const productKeys = state.products.map((p) => [normaliseHeader(p.name), normaliseHeader(p.id), "product" + p.id.slice(1)]);
     const products = state.products
-      .filter((p) => {
-        const keys = [normaliseHeader(p.name), normaliseHeader(p.id), "product" + p.id.slice(1)];
-        return keys.some((k) => k in byHeader && isYes(byHeader[k]));
-      })
+      .filter((p, i) => productKeys[i].some((k) => k in byHeader && isYes(byHeader[k])))
       .map((p) => p.id);
+
+    // Columns that aren't standard fields are kept as extra context for
+    // the campaign email skill (company description, recent news, etc.).
+    const known = new Set([...Object.values(HEADER_ALIASES).flat(), ...productKeys.flat()]);
+    const extra = {};
+    Object.keys(row).forEach((h) => {
+      const value = String(row[h]).trim();
+      if (value && !known.has(normaliseHeader(h))) extra[String(h).trim()] = value;
+    });
 
     const employees = parseEmployees(pick("employees"));
     return {
+      extra,
       name: pick("name"),
       role: pick("role"),
       company: pick("company"),
@@ -753,12 +926,19 @@
     }
     const product = productById(campaign.productId);
     const contacts = selectedContacts();
+    const counts = emailCounts(campaign, contacts);
+    const launchedCount = campaign.launched ? contacts.filter((c) => campaign.emails.get(c.id)?.status === "done").length : 0;
+
+    let intro;
+    if (!campaign.mode) intro = "Preparing the product information…";
+    else if (campaign.mode === "template") intro = `Sample content for ${contacts.length} ${contacts.length === 1 ? "contact" : "contacts"}. Connect Claude (add an API key on the server) to write each email from the product documents, the company's website, and the contact's record.`;
+    else intro = `Each email is written by Claude from the product documents, the company's website, and the contact's record. <strong id="email-progress">${progressText(counts, contacts.length)}</strong>.`;
 
     app.innerHTML = `
       <div class="page-head">
         <div>
           <h1>Campaign preview: ${esc(product.name)}</h1>
-          <p>Sample content for ${contacts.length} ${contacts.length === 1 ? "contact" : "contacts"}. Once the campaign skill is connected, each message will be written from the product information, the company's website, and the contact's job role.</p>
+          <p>${intro}</p>
         </div>
         <div class="actions">
           <button class="btn" id="back">Back to opportunities</button>
@@ -769,30 +949,30 @@
       </div>
       ${campaign.launched ? `
         <div class="notice">
-          <strong>Campaign launched.</strong> Content is ready for all ${contacts.length} selected contacts.
+          <strong>Campaign launched.</strong> Content is ready for ${launchedCount} of ${contacts.length} selected contacts.
           Email sending isn't connected yet, so download the content to send it.
         </div>` : ""}
       <div class="preview-list">
-        ${contacts.map((c) => {
-          const email = generateEmail(c, product);
-          return `
-          <article class="card email-card">
-            <div class="email-meta">
-              <span>To <strong>${esc(c.name)}</strong> &lt;${esc(c.email)}&gt;</span>
-              <span>${esc([c.role, c.company].filter(Boolean).join(", "))} ${c.website ? `<span class="chip">${esc(c.website)}</span>` : ""}</span>
-            </div>
-            <div class="email-body">
-              <p class="subject">${esc(email.subject)}</p>
-              ${email.paragraphs.map((para) => `<p>${esc(para)}</p>`).join("")}
-            </div>
-          </article>`;
-        }).join("")}
+        ${contacts.map((c) => emailCard(c)).join("")}
       </div>`;
 
     app.querySelector("#back").addEventListener("click", () => { location.hash = "#opportunities"; });
+    app.querySelector(".preview-list").addEventListener("click", (e) => {
+      const retry = e.target.closest("[data-retry]");
+      if (retry) {
+        const contact = state.customers.find((c) => c.id === Number(retry.dataset.retry));
+        if (contact) writeEmail(campaign, product, contact).then(() => updateProgress());
+      }
+    });
 
     const launch = app.querySelector("#launch");
     if (launch) launch.addEventListener("click", () => {
+      const now = emailCounts(campaign, contacts);
+      if (now.waiting) {
+        showToast(`Emails are still being written: ${now.done} of ${contacts.length} done`);
+        return;
+      }
+      if (now.error && !confirm(`${now.error} ${now.error === 1 ? "email" : "emails"} couldn't be written and will be left out. Launch anyway?`)) return;
       campaign.launched = true;
       renderPreview();
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -800,14 +980,69 @@
 
     const download = app.querySelector("#download");
     if (download) download.addEventListener("click", () => downloadCampaign(product, contacts));
+
+    runEmailWriting();
+  }
+
+  function emailCard(c) {
+    const entry = state.campaign.emails.get(c.id) || { status: "pending" };
+    const meta = `
+      <div class="email-meta">
+        <span>To <strong>${esc(c.name)}</strong> &lt;${esc(c.email)}&gt;</span>
+        <span>${esc([c.role, c.company].filter(Boolean).join(", "))} ${c.website ? `<span class="chip">${esc(c.website)}</span>` : ""}</span>
+      </div>`;
+
+    let body;
+    if (entry.status === "done") {
+      const email = { ...entry.email, learn_more_url: safeUrl(entry.email.learn_more_url) };
+      body = `
+        <p class="subject">${esc(email.subject)}</p>
+        <p>${esc(email.greeting)}</p>
+        ${email.paragraphs.map((para) => `<p>${esc(para)}</p>`).join("")}
+        ${email.learn_more_url
+          ? `<p><a class="learn-more" href="${esc(email.learn_more_url)}" target="_blank" rel="noopener">Learn more</a></p>`
+          : `<p class="empty-note">No product page URL, so there's no "Learn more" link. Add one on the Campaign Builder.</p>`}
+        <p>${esc(email.call_to_action)}</p>
+        ${email.research_notes ? `
+          <div class="research-notes">
+            <span class="section-label">Why this angle ${entry.fetchedWebsite === false ? "(website not reached)" : ""}</span>
+            ${esc(email.research_notes)}
+          </div>` : ""}`;
+    } else if (entry.status === "error") {
+      body = `<p class="description-note is-error">${esc(entry.error)}</p>
+        <button class="btn btn-small" data-retry="${c.id}">Try again</button>`;
+    } else if (entry.status === "writing") {
+      body = `<p class="generating">Reviewing ${esc(c.website || "the company")} and writing the email…</p>`;
+    } else {
+      body = `<p class="empty-note">Waiting to be written…</p>`;
+    }
+    return `<article class="card email-card" id="email-${c.id}">${meta}<div class="email-body">${body}</div></article>`;
+  }
+
+  function updateEmailCard(contactId) {
+    if (location.hash !== "#preview") return;
+    const el = document.getElementById(`email-${contactId}`);
+    const contact = state.customers.find((c) => c.id === contactId);
+    if (el && contact) el.outerHTML = emailCard(contact);
+    updateProgress();
+  }
+
+  function updateProgress() {
+    const el = document.getElementById("email-progress");
+    if (!el || !state.campaign) return;
+    const contacts = selectedContacts();
+    const counts = emailCounts(state.campaign, contacts);
+    el.textContent = progressText(counts, contacts.length);
   }
 
   function downloadCampaign(product, contacts) {
-    const csvCell = (v) => `"${String(v).replace(/"/g, '""')}"`;
-    const lines = [["Name", "Email", "Company", "Job role", "Subject", "Body"].map(csvCell).join(",")];
+    const csvCell = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+    const lines = [["Name", "Email", "Company", "Job role", "Subject", "Body", "Learn more URL", "Research notes"].map(csvCell).join(",")];
     contacts.forEach((c) => {
-      const email = generateEmail(c, product);
-      lines.push([c.name, c.email, c.company, c.role, email.subject, email.paragraphs.join("\n\n")].map(csvCell).join(","));
+      const entry = state.campaign.emails.get(c.id);
+      if (!entry || entry.status !== "done") return;
+      const email = entry.email;
+      lines.push([c.name, c.email, c.company, c.role, email.subject, emailPlainText(email), email.learn_more_url, email.research_notes].map(csvCell).join(","));
     });
     const blob = new Blob([lines.join("\r\n")], { type: "text/csv" });
     const link = document.createElement("a");
