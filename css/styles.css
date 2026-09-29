@@ -394,3 +394,18 @@ td.row-actions { white-space: nowrap; text-align: right; }
 }
 .add-product-card:hover { border-color: var(--slate); background: var(--white); }
 .add-product-plus { font-size: 28px; line-height: 1; color: var(--sage-dark); }
+
+/* Description written from documents */
+.description-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.btn-text {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--slate);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.btn-text:hover { text-decoration: underline; }
+.product-description:disabled { color: var(--ink-muted); background: var(--paper); }

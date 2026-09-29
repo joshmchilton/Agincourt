@@ -27,9 +27,10 @@ function isNotSignedIn(text) {
   return /not logged in|\/login/i.test(String(text || ""));
 }
 
-// Claude may only read files in the product's folder and fetch pages on the
-// contact's company website; every other tool call is denied.
-export function writeEmailWithSubscription({ system, prompt, cwd, siteHost, schema }) {
+// Runs one task that returns JSON matching `schema`. Claude may only read
+// files in `cwd` (the product's documents) and, when `siteHost` is given,
+// fetch pages on that website; every other tool call is denied.
+export function runWithSubscription({ system, prompt, cwd, siteHost, schema, effort = "high" }) {
   return withSlot(async () => {
     const tools = ["Read", "Glob"];
     const allowedTools = ["Read", "Glob"];
@@ -59,7 +60,7 @@ export function writeEmailWithSubscription({ system, prompt, cwd, siteHost, sche
         strictMcpConfig: true,
         persistSession: false,
         model: "opus",
-        effort: "high",
+        effort,
         maxTurns: 15,
         outputFormat: { type: "json_schema", schema },
       },
@@ -94,6 +95,6 @@ export function writeEmailWithSubscription({ system, prompt, cwd, siteHost, sche
       if (isNotSignedIn(result.result)) throw new NotSignedInError("Claude Code isn't signed in on this machine.");
       throw new Error(`Claude Code error (${result.subtype}): ${String(result.result || "").slice(0, 300)}`);
     }
-    return { email: result.structured_output, fetchedWebsite };
+    return { output: result.structured_output, fetchedWebsite };
   });
 }

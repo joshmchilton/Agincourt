@@ -13,7 +13,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as db from "./db.js";
-import { NotSignedInError, writeEmailWithSubscription } from "./subscription-engine.js";
+import { NotSignedInError, runWithSubscription } from "./subscription-engine.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 8080;
@@ -97,6 +97,23 @@ async function loadSkill() {
   const text = await readFile(SKILL_PATH, "utf8");
   return text.replace(/^---[\s\S]*?---\s*/, "").trim();
 }
+
+// ---------- Product descriptions ----------
+
+const DESCRIBE_SYSTEM = `You write the short product description shown on a product card in a B2B campaign builder. Sales teams read it to understand the product at a glance.
+
+From the product documentation, write one short sentence, or two very short ones: no more than 16 words and 110 characters in total, so it fits in two or three lines of a narrow card. Say what the product does and who it's for, and include the main benefit if it fits. Use only facts from the documentation. Write plain prose: no headings, bullet points, quotation marks, or superlatives such as "revolutionary" or "best-in-class".`;
+
+// About three lines on a product card when three products sit side by side.
+const DESCRIPTION_TARGET_CHARS = 110;
+const DESCRIPTION_MAX_CHARS = 125;
+
+const DESCRIPTION_SCHEMA = {
+  type: "object",
+  properties: { description: { type: "string" } },
+  required: ["description"],
+  additionalProperties: false,
+};
 
 const EMAIL_SCHEMA = {
   type: "object",
@@ -224,6 +241,84 @@ app.post("/api/contacts/import", dataRoute(async (req, res) => {
   res.status(201).json(await db.importContacts(contacts, mode));
 }));
 
+// Writes the product's description from its uploaded documents and saves it.
+app.post("/api/products/:id/describe", async (req, res) => {
+  if (!ENGINE) return res.status(503).json(NOT_CONFIGURED);
+  if (!db.dbConfigured) return res.status(503).json(DB_NOT_CONFIGURED);
+  if (!validProductId(req.params.id)) return res.status(400).json({ error: "bad_product", message: "Unknown product." });
+
+  let product;
+  let stored;
+  try {
+    product = await db.getProduct(req.params.id);
+    if (!product) return res.status(404).json({ error: "not_found", message: "That product no longer exists." });
+    stored = await productContext(product);
+  } catch (err) {
+    console.error("Couldn't load product documents:", err.message || err);
+    return res.status(500).json({ error: "db_error", message: "The product documents couldn't be loaded. Try again." });
+  }
+  if (stored.blocks.length === 0) {
+    return res.status(422).json({ error: "no_documents", message: "Upload product information to write a description." });
+  }
+
+  // One attempt; `feedback` asks for a shorter rewrite of a previous draft.
+  async function writeDescription(feedback = "") {
+    const ask = `Write the description for ${product.name}.${feedback ? ` ${feedback}` : ""}`;
+    if (ENGINE === "subscription") {
+      const { output } = await runWithSubscription({
+        system: DESCRIBE_SYSTEM,
+        prompt: `${ask} The product documentation is in these files in your working directory; read them first:\n${stored.fileNames.map((n) => `- ${n}`).join("\n")}`,
+        cwd: stored.dir,
+        schema: DESCRIPTION_SCHEMA,
+        effort: "low",
+      });
+      return String(output?.description || "").trim();
+    }
+    const response = await client.beta.messages.create({
+      model: MODEL,
+      max_tokens: 16000,
+      output_config: { effort: "low", format: { type: "json_schema", schema: DESCRIPTION_SCHEMA } },
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      system: DESCRIBE_SYSTEM,
+      messages: [{ role: "user", content: [...stored.blocks, { type: "text", text: ask }] }],
+    });
+    if (response.stop_reason === "refusal") return null;
+    const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+    return String(parseEmail(text)?.description || "").trim();
+  }
+
+  let description;
+  try {
+    description = await writeDescription();
+    // Keep it to two or three lines on the card: one shorter rewrite if needed.
+    if (description && description.length > DESCRIPTION_MAX_CHARS) {
+      const shorter = await writeDescription(
+        `Your previous draft was ${description.length} characters: "${description}". Rewrite it in no more than ${DESCRIPTION_TARGET_CHARS} characters.`
+      );
+      if (shorter && shorter.length < description.length) description = shorter;
+    }
+    if (description === null) {
+      return res.status(422).json({ error: "refused", message: "A description couldn't be written from these documents." });
+    }
+  } catch (err) {
+    if (err instanceof NotSignedInError) {
+      return res.status(503).json({ error: "not_signed_in", message: "Claude Code isn't signed in on this machine. Run: npm run login" });
+    }
+    if (err instanceof Anthropic.APIError) return sendApiError(res, err, "description");
+    console.error(err);
+    return res.status(502).json({ error: "describe_error", message: "The description couldn't be written. Try again." });
+  }
+
+  if (!description) return res.status(502).json({ error: "bad_output", message: "The description couldn't be written. Try again." });
+  try {
+    res.json(await db.updateProduct(product.id, { description }));
+  } catch (err) {
+    console.error("Couldn't save description:", err.message || err);
+    res.status(500).json({ error: "db_error", message: "The description was written but couldn't be saved. Try again." });
+  }
+});
+
 // ---------- Campaign emails ----------
 
 // Loads a product's documents from Supabase once per set of documents, and
@@ -325,7 +420,7 @@ app.post("/api/campaign-email", async (req, res) => {
       : "No product documentation was uploaded; rely on the description.";
     const prompt = [...productLines, "", docList, "", contactText].join("\n");
     try {
-      const { email, fetchedWebsite } = await writeEmailWithSubscription({
+      const { output: email, fetchedWebsite } = await runWithSubscription({
         system: await loadSkill(),
         prompt,
         cwd: stored.dir,

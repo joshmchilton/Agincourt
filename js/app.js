@@ -328,6 +328,10 @@
       btn.addEventListener("click", () => removeDocument(productById(btn.dataset.id), btn.dataset.remove));
     });
 
+    app.querySelectorAll("[data-describe]").forEach((btn) => {
+      btn.addEventListener("click", () => describeProduct(productById(btn.dataset.describe)));
+    });
+
     app.querySelectorAll("[data-remove-product]").forEach((btn) => {
       btn.addEventListener("click", () => removeProduct(btn.dataset.removeProduct));
     });
@@ -349,10 +353,36 @@
       })));
       const added = await api("POST", `/api/products/${p.id}/documents`, { files: payload });
       p.documents.push(...added);
+      p.uploading -= files.length;
+      describeProduct(p);
+      return;
     } catch (err) {
       reportError(err);
     }
     p.uploading -= files.length;
+    refreshCampaigns();
+  }
+
+  // Asks the server to write the description from the product's documents.
+  // It's saved in Supabase and can still be edited by hand afterwards.
+  async function describeProduct(p) {
+    p.describeError = "";
+    if (!state.ai || !p.documents.length) return refreshCampaigns();
+    const requestId = (p.describeRequest || 0) + 1;
+    p.describeRequest = requestId;
+    p.describing = true;
+    refreshCampaigns();
+    try {
+      const updated = await api("POST", `/api/products/${p.id}/describe`);
+      if (p.describeRequest !== requestId) return; // a newer request took over
+      clearTimeout(pendingProductSaves.get(p.id));
+      pendingProductSaves.delete(p.id);
+      p.description = updated.description;
+    } catch (err) {
+      if (p.describeRequest !== requestId) return;
+      p.describeError = err.message;
+    }
+    p.describing = false;
     refreshCampaigns();
   }
 
@@ -362,7 +392,8 @@
     try {
       await api("DELETE", `/api/products/${p.id}/documents/${documentId}`);
       p.documents = p.documents.filter((d) => d.id !== documentId);
-      refreshCampaigns();
+      if (p.documents.length) describeProduct(p);
+      else refreshCampaigns();
     } catch (err) {
       reportError(err);
     }
@@ -441,10 +472,18 @@
           </label>
           ${files}
         </div>
-        <label class="field">
-          <span class="section-label" style="margin-bottom:0">Description</span>
-          <textarea class="product-description" data-id="${p.id}" rows="4" placeholder="What the product does, who it's for, and the main benefit.">${esc(p.description || "")}</textarea>
-        </label>
+        <div class="field">
+          <div class="description-head">
+            <label class="section-label" style="margin-bottom:0" for="desc-${p.id}">Description</label>
+            ${state.ai && docs.length && !p.describing
+              ? `<button class="btn-text" data-describe="${p.id}">Rewrite from documents</button>`
+              : ""}
+          </div>
+          <textarea class="product-description" id="desc-${p.id}" data-id="${p.id}" rows="3" ${p.describing ? "disabled" : ""} placeholder="${docs.length ? "What the product does, who it's for, and the main benefit." : "Upload product information and the description is written for you."}">${esc(p.description || "")}</textarea>
+          ${p.describing ? `<span class="generating">Writing the description from the documents…</span>` : ""}
+          ${p.describeError ? `<span class="description-note is-error">${esc(p.describeError)}</span>` : ""}
+          ${!state.ai && docs.length ? `<span class="empty-note">Connect Claude on the server to write this automatically.</span>` : ""}
+        </div>
         <button class="btn btn-primary btn-block" data-generate="${p.id}">Create Campaign</button>
       </article>`;
   }
