@@ -1,0 +1,17 @@
+{
+  "name": "agincourt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
+    "express": "^5.2.1",
+    "mammoth": "^1.13.0"
+  }
+}

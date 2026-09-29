@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "agincourt",
-      "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "8080"],
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["start"],
       "port": 8080
     }
   ]

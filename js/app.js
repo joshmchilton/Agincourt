@@ -81,12 +81,79 @@
   }
 
   // ---------- Description generation ----------
-  // Placeholder: summarises readable text files locally. Swap for the
-  // AI generation step once the product information skill is connected.
+  // Uploaded files go to the server, which asks Claude for a description.
+  // If the server has no API key (or isn't running), a basic summary of any
+  // text files is used instead.
 
   const TEXT_TYPES = /\.(txt|md|csv|html?|json)$/i;
 
-  async function buildDescription(product) {
+  function readAsBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function describeProduct(p) {
+    const requestId = (p.requestId || 0) + 1;
+    p.requestId = requestId;
+    p.descriptionNote = "";
+
+    if (p.files.length === 0) {
+      p.description = "";
+      p.descriptionStatus = "idle";
+      return refreshCampaigns();
+    }
+
+    p.descriptionStatus = "generating";
+    refreshCampaigns();
+
+    let result;
+    try {
+      const files = await Promise.all(p.files.map(async (f) => ({
+        name: f.name,
+        type: f.file.type,
+        data: await readAsBase64(f.file),
+      })));
+      const res = await fetch("/api/describe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productName: p.name, files }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) result = { description: body.description, skipped: body.skipped || [] };
+      else if (res.status === 503 || res.status === 404 || res.status === 501) result = { fallback: true };
+      else result = { error: body.message || "The description couldn't be generated." };
+    } catch (e) {
+      result = { fallback: true };
+    }
+
+    if (p.requestId !== requestId) return; // a newer upload has taken over
+
+    if (result.fallback) {
+      p.description = await buildLocalDescription(p);
+      p.descriptionStatus = "fallback";
+      p.descriptionNote = p.description
+        ? "Basic summary. Connect Claude to generate descriptions from PDFs and Word files."
+        : "Connect Claude to generate a description from these files.";
+    } else if (result.error) {
+      p.descriptionStatus = "error";
+      p.descriptionNote = result.error;
+    } else {
+      p.description = result.description;
+      p.descriptionStatus = "done";
+      if (result.skipped.length) p.descriptionNote = `Couldn't read: ${result.skipped.join(", ")}.`;
+    }
+    refreshCampaigns();
+  }
+
+  function refreshCampaigns() {
+    if ((location.hash.replace("#", "") || "campaigns") === "campaigns") renderCampaigns();
+  }
+
+  async function buildLocalDescription(product) {
     if (product.files.length === 0) return "";
     const textFiles = product.files.filter((f) => TEXT_TYPES.test(f.name));
     for (const f of textFiles) {
@@ -180,22 +247,20 @@
     });
 
     app.querySelectorAll("input[type=file]").forEach((input) => {
-      input.addEventListener("change", async () => {
+      input.addEventListener("change", () => {
         const p = productById(input.dataset.id);
         Array.from(input.files).forEach((file) => {
           p.files.push({ name: file.name, size: file.size, file });
         });
-        p.description = await buildDescription(p);
-        renderCampaigns();
+        describeProduct(p);
       });
     });
 
     app.querySelectorAll("[data-remove]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", () => {
         const p = productById(btn.dataset.id);
         p.files.splice(Number(btn.dataset.remove), 1);
-        p.description = await buildDescription(p);
-        renderCampaigns();
+        describeProduct(p);
       });
     });
 
@@ -215,9 +280,13 @@
       : `<p class="empty-note" style="margin-top:10px">No product information uploaded yet.</p>`;
 
     let description;
-    if (p.description) description = esc(p.description);
-    else if (p.files.length) description = `<span class="empty-note">A description will be generated from the uploaded information.</span>`;
-    else description = `<span class="empty-note">Upload product information to generate a description.</span>`;
+    if (p.descriptionStatus === "generating") description = `<span class="generating">Generating description…</span>`;
+    else if (p.description) description = esc(p.description);
+    else if (!p.files.length) description = `<span class="empty-note">Upload product information to generate a description.</span>`;
+    else description = "";
+    if (p.descriptionNote && p.descriptionStatus !== "generating") {
+      description += `<span class="description-note ${p.descriptionStatus === "error" ? "is-error" : ""}">${esc(p.descriptionNote)}</span>`;
+    }
 
     return `
       <article class="card product-card">
