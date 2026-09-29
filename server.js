@@ -102,8 +102,9 @@ const EMAIL_SCHEMA = {
     learn_more_url: { type: "string" },
     call_to_action: { type: "string" },
     research_notes: { type: "string" },
+    roi_basis: { type: "string" },
   },
-  required: ["subject", "greeting", "paragraphs", "learn_more_url", "call_to_action", "research_notes"],
+  required: ["subject", "greeting", "paragraphs", "learn_more_url", "call_to_action", "research_notes", "roi_basis"],
   additionalProperties: false,
 };
 
@@ -249,7 +250,8 @@ app.post("/api/campaign-email", async (req, res) => {
       response = await client.beta.messages.create({
         model: MODEL,
         max_tokens: 16000,
-        output_config: { effort: "medium", format: { type: "json_schema", schema: EMAIL_SCHEMA } },
+        // High effort: the ROI example needs careful reading and arithmetic.
+        output_config: { effort: "high", format: { type: "json_schema", schema: EMAIL_SCHEMA } },
         betas: ["server-side-fallback-2026-07-01"],
         fallbacks: "default",
         system,

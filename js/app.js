@@ -1007,6 +1007,15 @@
           <div class="research-notes">
             <span class="section-label">Why this angle ${entry.fetchedWebsite === false ? "(website not reached)" : ""}</span>
             ${esc(email.research_notes)}
+          </div>` : ""}
+        ${email.roi_basis ? `
+          <div class="research-notes">
+            <span class="section-label">How the ROI was worked out</span>
+            ${esc(email.roi_basis)}
+          </div>` : ""}
+        ${entry.template ? `
+          <div class="research-notes template-note">
+            Basic template, not written by Claude: no website review or ROI example. Add an API key on the server to use the campaign email skill.
           </div>` : ""}`;
     } else if (entry.status === "error") {
       body = `<p class="description-note is-error">${esc(entry.error)}</p>
@@ -1037,12 +1046,12 @@
 
   function downloadCampaign(product, contacts) {
     const csvCell = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
-    const lines = [["Name", "Email", "Company", "Job role", "Subject", "Body", "Learn more URL", "Research notes"].map(csvCell).join(",")];
+    const lines = [["Name", "Email", "Company", "Job role", "Subject", "Body", "Learn more URL", "Research notes", "ROI basis"].map(csvCell).join(",")];
     contacts.forEach((c) => {
       const entry = state.campaign.emails.get(c.id);
       if (!entry || entry.status !== "done") return;
       const email = entry.email;
-      lines.push([c.name, c.email, c.company, c.role, email.subject, emailPlainText(email), email.learn_more_url, email.research_notes].map(csvCell).join(","));
+      lines.push([c.name, c.email, c.company, c.role, email.subject, emailPlainText(email), email.learn_more_url, email.research_notes, email.roi_basis].map(csvCell).join(","));
     });
     const blob = new Blob([lines.join("\r\n")], { type: "text/csv" });
     const link = document.createElement("a");

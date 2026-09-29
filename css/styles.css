@@ -360,3 +360,5 @@ td.row-actions { white-space: nowrap; text-align: right; }
   color: var(--ink-soft);
 }
 .research-notes .section-label { display: block; margin-bottom: 4px; }
+
+.template-note { background: #FAEEDA; border-color: #F0D9B0; color: #633806; }
