@@ -4,7 +4,7 @@
   const data = window.AGINCOURT_DATA;
   const app = document.getElementById("app");
   const NAMES_KEY = "agincourt.productNames";
-  const CUSTOMERS_KEY = "agincourt.customers";
+  const CUSTOMERS_KEY = "agincourt.opportunities";
 
   const state = {
     products: data.products.map((p) => ({ ...p, files: [], description: "" })),
@@ -157,7 +157,7 @@
       <div class="page-head">
         <div>
           <h1>Campaign Builder</h1>
-          <p>Upload product information, then generate a campaign for customers who don't yet buy that product.</p>
+          <p>Upload product information, then generate a campaign for contacts who don't yet buy that product.</p>
         </div>
       </div>
       <div class="product-grid">
@@ -244,7 +244,7 @@
     );
     state.campaign = { productId, selected, launched: false };
     state.search = "";
-    location.hash = "#customers";
+    location.hash = "#opportunities";
   }
 
   function renderCustomers() {
@@ -254,10 +254,10 @@
     app.innerHTML = `
       <div class="page-head">
         <div>
-          <h1>Customer Database</h1>
+          <h1>Opportunity Database</h1>
           <p>${campaign
-            ? `Customers who don't buy ${esc(product.name)} are selected. Add or remove anyone before continuing.`
-            : `All customers and the products they currently buy.`}</p>
+            ? `Contacts who don't buy ${esc(product.name)} are selected. Add or remove anyone before continuing.`
+            : `All contacts and the products they currently buy.`}</p>
         </div>
         ${campaign ? `
           <div class="actions">
@@ -273,7 +273,7 @@
           </div>
         </div>` : ""}
       <div class="toolbar">
-        <input class="search" type="search" placeholder="Search name, company, industry or email" value="${esc(state.search)}" aria-label="Search customers">
+        <input class="search" type="search" placeholder="Search name, company, industry or email" value="${esc(state.search)}" aria-label="Search contacts">
         <div class="actions toolbar-actions">
           <button class="btn" id="add-contact">Add contact</button>
           <button class="btn" id="import-contacts">Upload from file</button>
@@ -296,7 +296,7 @@
     if (campaign) {
       app.querySelector("#continue").addEventListener("click", () => {
         if (campaign.selected.size === 0) {
-          alert("Select at least one customer to continue.");
+          alert("Select at least one contact to continue.");
           return;
         }
         location.hash = "#preview";
@@ -351,7 +351,7 @@
               : `<td class="center"><span class="mark no" title="Doesn't buy ${esc(p.name)}">✕</span></td>`).join("")}
           </tr>`;
         }).join("")}
-        ${rows.length === 0 ? `<tr><td colspan="${columnCount}" class="empty-note">No customers match your search.</td></tr>` : ""}
+        ${rows.length === 0 ? `<tr><td colspan="${columnCount}" class="empty-note">${state.customers.length === 0 ? "No contacts yet. Add a contact or upload a file to get started." : "No contacts match your search."}</td></tr>` : ""}
       </tbody>`;
 
     if (!campaign) return;
@@ -378,7 +378,7 @@
 
   function updateSelectedCount() {
     const el = app.querySelector("#selected-count");
-    if (el) el.textContent = `${state.campaign.selected.size} of ${state.customers.length} customers selected`;
+    if (el) el.textContent = `${state.campaign.selected.size} of ${state.customers.length} contacts selected`;
   }
 
   // ---------- Adding contacts ----------
@@ -639,7 +639,7 @@
           <p>Sample content for ${contacts.length} ${contacts.length === 1 ? "contact" : "contacts"}. Once the campaign skill is connected, each message will be written from the product information, the company's website, and the contact's job role.</p>
         </div>
         <div class="actions">
-          <button class="btn" id="back">Back to customers</button>
+          <button class="btn" id="back">Back to opportunities</button>
           ${campaign.launched
             ? `<button class="btn btn-primary" id="download">Download campaign content</button>`
             : `<button class="btn btn-primary" id="launch">Approve and Launch Campaign</button>`}
@@ -667,7 +667,7 @@
         }).join("")}
       </div>`;
 
-    app.querySelector("#back").addEventListener("click", () => { location.hash = "#customers"; });
+    app.querySelector("#back").addEventListener("click", () => { location.hash = "#opportunities"; });
 
     const launch = app.querySelector("#launch");
     if (launch) launch.addEventListener("click", () => {
@@ -700,14 +700,14 @@
   const routes = {
     leads: renderLeads,
     campaigns: renderCampaigns,
-    customers: renderCustomers,
+    opportunities: renderCustomers,
     preview: renderPreview,
   };
 
   function route() {
     const name = location.hash.replace("#", "") || "campaigns";
     const view = routes[name] || renderCampaigns;
-    const activeTab = name === "preview" ? "customers" : (routes[name] ? name : "campaigns");
+    const activeTab = name === "preview" ? "opportunities" : (routes[name] ? name : "campaigns");
     document.querySelectorAll(".tabs a").forEach((a) => {
       a.classList.toggle("active", a.dataset.tab === activeTab);
     });
