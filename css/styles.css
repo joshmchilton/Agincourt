@@ -320,3 +320,10 @@ td.num, th.num { text-align: right; white-space: nowrap; }
   .toolbar-actions { margin-left: 0; width: 100%; }
   .toolbar-actions .btn { flex: 1; }
 }
+
+/* Row actions */
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+td.row-actions { white-space: nowrap; text-align: right; }
+.btn-small { padding: 4px 10px; font-size: 13px; }
+.btn-danger { color: #A32D2D; }
+.btn-danger:hover { border-color: #A32D2D; }

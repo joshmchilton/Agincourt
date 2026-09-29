@@ -315,7 +315,7 @@
     const rows = state.customers.filter((c) =>
       !q || [c.name, c.company, c.email, c.role, c.industry, c.website].some((v) => String(v || "").toLowerCase().includes(q))
     );
-    const columnCount = 8 + state.products.length + (campaign ? 1 : 0);
+    const columnCount = 9 + state.products.length + (campaign ? 1 : 0);
 
     const allSelected = campaign && rows.length > 0 && rows.every((c) => campaign.selected.has(c.id));
 
@@ -331,6 +331,7 @@
           <th>Contact email</th>
           <th>Contact phone number</th>
           ${state.products.map((p) => `<th class="center ${campaign && campaign.productId === p.id ? "highlight" : ""}">${esc(p.name)}</th>`).join("")}
+          <th class="row-actions"><span class="sr-only">Actions</span></th>
         </tr>
       </thead>
       <tbody>
@@ -349,10 +350,21 @@
             ${state.products.map((p) => c.products.includes(p.id)
               ? `<td class="center"><span class="mark yes" title="Buys ${esc(p.name)}">✓</span></td>`
               : `<td class="center"><span class="mark no" title="Doesn't buy ${esc(p.name)}">✕</span></td>`).join("")}
+            <td class="row-actions">
+              <button class="btn btn-small" data-edit="${c.id}" aria-label="Edit ${esc(c.name)}">Edit</button>
+              <button class="btn btn-small btn-danger" data-delete="${c.id}" aria-label="Delete ${esc(c.name)}">Delete</button>
+            </td>
           </tr>`;
         }).join("")}
         ${rows.length === 0 ? `<tr><td colspan="${columnCount}" class="empty-note">${state.customers.length === 0 ? "No contacts yet. Add a contact or upload a file to get started." : "No contacts match your search."}</td></tr>` : ""}
       </tbody>`;
+
+    table.querySelectorAll("[data-edit]").forEach((btn) => {
+      btn.addEventListener("click", () => openContactForm(Number(btn.dataset.edit)));
+    });
+    table.querySelectorAll("[data-delete]").forEach((btn) => {
+      btn.addEventListener("click", () => deleteContact(Number(btn.dataset.delete)));
+    });
 
     if (!campaign) return;
 
@@ -401,13 +413,13 @@
     return `
       <dialog id="add-dialog" class="dialog">
         <form method="dialog" novalidate>
-          <h2>Add contact</h2>
+          <h2 id="contact-form-title">Add contact</h2>
           <div class="field-grid">
             ${field("name", "Contact name *", "text", "Jane Smith")}
             ${field("role", "Job role", "text", "Operations Director")}
             ${field("company", "Contact company", "text", "Acme Ltd")}
             ${field("website", "Company website", "text", "acme.co.uk")}
-            ${field("employees", "# Employees", "number", "250")}
+            ${field("employees", "# Employees", "text", "250 or 201-500")}
             ${field("industry", "Industry", "text", "Manufacturing")}
             ${field("email", "Contact email *", "email", "jane.smith@acme.co.uk")}
             ${field("phone", "Contact phone number", "tel", "01632 960 000")}
@@ -420,22 +432,45 @@
           <p class="form-error" id="add-error" role="alert"></p>
           <div class="dialog-actions">
             <button type="button" class="btn" data-close>Cancel</button>
-            <button type="submit" class="btn btn-primary">Add contact</button>
+            <button type="submit" class="btn btn-primary" id="contact-form-submit">Add contact</button>
           </div>
         </form>
       </dialog>`;
   }
 
+  // Numbers like "1,500" become 1500; ranges like "501-1,000" stay as text.
+  function parseEmployees(raw) {
+    const value = String(raw == null ? "" : raw).trim();
+    const count = Number(value.replace(/,/g, ""));
+    return value !== "" && Number.isFinite(count) ? count : value;
+  }
+
+  const CONTACT_TEXT_FIELDS = ["name", "role", "company", "website", "employees", "industry", "email", "phone"];
+
+  // Set by wireAddContact; opens the contact form, prefilled when given an id.
+  let openContactForm = () => {};
+
   function wireAddContact() {
     const dialog = app.querySelector("#add-dialog");
     const form = dialog.querySelector("form");
     const error = dialog.querySelector("#add-error");
+    let editingId = null;
 
-    app.querySelector("#add-contact").addEventListener("click", () => {
+    openContactForm = (id = null) => {
+      editingId = id;
       form.reset();
       error.textContent = "";
+      const contact = id != null && state.customers.find((c) => c.id === id);
+      dialog.querySelector("#contact-form-title").textContent = contact ? "Edit contact" : "Add contact";
+      dialog.querySelector("#contact-form-submit").textContent = contact ? "Save changes" : "Add contact";
+      if (contact) {
+        CONTACT_TEXT_FIELDS.forEach((f) => { form.elements[f].value = contact[f] == null ? "" : contact[f]; });
+        form.querySelectorAll("[name=products]").forEach((box) => { box.checked = contact.products.includes(box.value); });
+      }
       dialog.showModal();
-    });
+    };
+
+    app.querySelector("#add-contact").addEventListener("click", () => openContactForm());
     dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
     form.addEventListener("input", () => { error.textContent = ""; });
 
@@ -447,24 +482,42 @@
       if (!name) { error.textContent = "Enter a contact name."; return; }
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { error.textContent = "Enter a valid email address."; return; }
 
-      const contact = {
-        id: nextCustomerId(),
+      const fields = {
         name,
         role: (values.role || "").trim(),
         company: (values.company || "").trim(),
         website: (values.website || "").trim(),
-        employees: values.employees === "" ? "" : Number(values.employees),
+        employees: parseEmployees(values.employees),
         industry: (values.industry || "").trim(),
         email,
         phone: (values.phone || "").trim(),
         products: new FormData(form).getAll("products"),
       };
-      state.customers.push(contact);
-      addToCampaignIfEligible(contact);
+
+      const existing = editingId != null && state.customers.find((c) => c.id === editingId);
+      if (existing) {
+        Object.assign(existing, fields);
+      } else {
+        const contact = { id: nextCustomerId(), ...fields };
+        state.customers.push(contact);
+        addToCampaignIfEligible(contact);
+      }
       saveCustomers();
       dialog.close();
       renderCustomerTable();
+      if (existing) showToast("Contact updated");
     });
+  }
+
+  function deleteContact(id) {
+    const contact = state.customers.find((c) => c.id === id);
+    if (!contact) return;
+    if (!confirm(`Delete ${contact.name || contact.email}? This can't be undone.`)) return;
+    state.customers = state.customers.filter((c) => c.id !== id);
+    if (state.campaign) state.campaign.selected.delete(id);
+    saveCustomers();
+    renderCustomerTable();
+    showToast("Contact deleted");
   }
 
   // ---------- Importing contacts ----------
@@ -506,13 +559,13 @@
       })
       .map((p) => p.id);
 
-    const employees = pick("employees").replace(/,/g, "");
+    const employees = parseEmployees(pick("employees"));
     return {
       name: pick("name"),
       role: pick("role"),
       company: pick("company"),
       website: pick("website"),
-      employees: employees !== "" && Number.isFinite(Number(employees)) ? Number(employees) : employees,
+      employees,
       industry: pick("industry"),
       email: pick("email"),
       phone: pick("phone"),
