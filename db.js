@@ -174,6 +174,87 @@ export async function deleteContact(id) {
   check(await supabase.from("contacts").delete().eq("id", id));
 }
 
+export async function productNames() {
+  const rows = check(await supabase.from("products").select("id, name"));
+  return Object.fromEntries(rows.map((r) => [r.id, r.name]));
+}
+
+// ---------- Campaigns and qualified leads ----------
+
+// Records a launched campaign and one engagement row per recipient.
+// Engagement stays at "not opened" until email tracking reports otherwise.
+export async function createCampaign(productId, name, contactIds) {
+  const campaign = check(await supabase
+    .from("campaigns")
+    .insert({ product_id: productId, name })
+    .select()
+    .single());
+  const rows = contactIds.map((contactId) => ({ campaign_id: campaign.id, contact_id: contactId }));
+  for (let i = 0; i < rows.length; i += 500) check(await supabase.from("campaign_engagements").insert(rows.slice(i, i + 500)));
+  return { id: Number(campaign.id), name: campaign.name, recipients: rows.length };
+}
+
+function leadFromRow(row) {
+  return {
+    id: Number(row.id),
+    campaign: {
+      id: Number(row.campaigns.id),
+      name: row.campaigns.name,
+      productId: row.campaigns.product_id,
+      launchedAt: row.campaigns.launched_at,
+      isDemo: row.campaigns.is_demo,
+    },
+    contact: contactFromRow(row.contacts),
+    openedAt: row.opened_at,
+    readSeconds: row.read_seconds,
+    clickedThrough: row.clicked_through,
+    websiteSeconds: row.website_seconds,
+    hasBrief: Array.isArray(row.lead_briefs) ? row.lead_briefs.length > 0 : Boolean(row.lead_briefs),
+  };
+}
+
+const LEAD_SELECT = "*, campaigns(*), contacts(*), lead_briefs(engagement_id)";
+
+// Qualified leads are recipients who at least opened the email.
+export async function listLeads() {
+  const [rows, campaigns] = await Promise.all([
+    supabase.from("campaign_engagements").select(LEAD_SELECT).eq("email_opened", true).order("opened_at", { ascending: false }).then(check),
+    supabase.from("campaigns").select("id, name, product_id, launched_at, is_demo, campaign_engagements(email_opened, clicked_through)").order("launched_at", { ascending: false }).then(check),
+  ]);
+  return {
+    leads: rows.map(leadFromRow),
+    campaigns: campaigns.map((c) => ({
+      id: Number(c.id),
+      name: c.name,
+      productId: c.product_id,
+      launchedAt: c.launched_at,
+      isDemo: c.is_demo,
+      sent: c.campaign_engagements.length,
+      opened: c.campaign_engagements.filter((e) => e.email_opened).length,
+      clicked: c.campaign_engagements.filter((e) => e.clicked_through).length,
+    })),
+  };
+}
+
+export async function getLead(engagementId) {
+  const row = check(await supabase.from("campaign_engagements").select(LEAD_SELECT).eq("id", engagementId).maybeSingle());
+  return row && row.email_opened ? leadFromRow(row) : null;
+}
+
+export async function getBrief(engagementId) {
+  const row = check(await supabase.from("lead_briefs").select("brief, created_at").eq("engagement_id", engagementId).maybeSingle());
+  return row ? { ...row.brief, writtenAt: row.created_at } : null;
+}
+
+export async function saveBrief(engagementId, brief) {
+  const row = check(await supabase
+    .from("lead_briefs")
+    .upsert({ engagement_id: engagementId, brief, created_at: new Date().toISOString() })
+    .select("brief, created_at")
+    .single());
+  return { ...row.brief, writtenAt: row.created_at };
+}
+
 // mode "replace" removes every existing contact first.
 export async function importContacts(contacts, mode) {
   if (mode === "replace") check(await supabase.from("contacts").delete().gte("id", 0));

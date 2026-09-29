@@ -90,12 +90,95 @@ function sendApiError(res, err, what) {
 
 // ---------- Campaign email skill ----------
 
-const SKILL_PATH = path.join(here, "skills", "campaign-email", "SKILL.md");
-
-// Read on each request so edits to the skill apply without a restart.
-async function loadSkill() {
-  const text = await readFile(SKILL_PATH, "utf8");
+// Skills are read on each request so edits apply without a restart.
+async function loadSkill(name) {
+  const text = await readFile(path.join(here, "skills", name, "SKILL.md"), "utf8");
   return text.replace(/^---[\s\S]*?---\s*/, "").trim();
+}
+
+class SkillError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+// Runs a skill for one product and one company: Claude gets the product's
+// details and documents, the task text, and permission to fetch pages on the
+// company's website. Returns { output, fetchedWebsite }.
+async function runSkill({ skill, product, stored, taskText, schema, site, effort = "high" }) {
+  const system = await loadSkill(skill);
+  const productLines = [
+    `Product name: ${product.name || "(not given)"}`,
+    `Product description: ${product.description || "(not given)"}`,
+    `Product page URL: ${product.pageUrl || "(not given)"}`,
+  ];
+  const siteHost = site ? site.hostname.replace(/^www\./, "") : null;
+
+  if (ENGINE === "subscription") {
+    const docList = stored.fileNames.length
+      ? `The product documentation is in these files in your working directory. Read all of them before writing:\n${stored.fileNames.map((n) => `- ${n}`).join("\n")}`
+      : "No product documentation was uploaded; rely on the description.";
+    const { output, fetchedWebsite } = await runWithSubscription({
+      system,
+      prompt: [...productLines, "", docList, "", taskText].join("\n"),
+      cwd: stored.dir,
+      siteHost,
+      schema,
+      effort,
+    });
+    return { output, fetchedWebsite };
+  }
+
+  const docs = stored.blocks;
+  // Product text and documents are the same for every company, so they sit
+  // before the cache breakpoint; the company-specific task follows.
+  const productText = [...productLines, docs.length ? "The product documentation follows." : "No product documentation was uploaded; rely on the description."].join("\n");
+  const productBlocks = [{ type: "text", text: productText }, ...docs.map((d) => ({ ...d }))];
+  productBlocks[productBlocks.length - 1].cache_control = { type: "ephemeral" };
+  const tools = siteHost
+    ? [{ type: "web_fetch_20260209", name: "web_fetch", max_uses: 3, allowed_domains: [siteHost] }]
+    : [];
+
+  const messages = [{ role: "user", content: [...productBlocks, { type: "text", text: taskText }] }];
+  let response;
+  for (let turn = 0; turn < 5; turn++) {
+    response = await client.beta.messages.create({
+      model: MODEL,
+      max_tokens: 16000,
+      output_config: { effort, format: { type: "json_schema", schema } },
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      system,
+      ...(tools.length ? { tools } : {}),
+      messages,
+    });
+    if (response.stop_reason !== "pause_turn") break;
+    messages.push({ role: "assistant", content: response.content });
+  }
+  if (response.stop_reason === "refusal") throw new SkillError("refused", "Claude declined this request.");
+  const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  const output = text ? parseEmail(text) : null;
+  if (!output) {
+    console.error("Unexpected skill output:", response.stop_reason, text.slice(0, 500));
+    throw new SkillError("bad_output", "Claude's reply couldn't be read. Try again.");
+  }
+  const allBlocks = [...messages.slice(1).flatMap((m) => m.content), ...response.content];
+  const fetchedWebsite = allBlocks.some((b) => b.type === "web_fetch_tool_result" && !b.content?.error_code);
+  return { output, fetchedWebsite };
+}
+
+// Sends the right response for an error thrown while running a skill.
+function sendSkillError(res, err, what) {
+  if (err instanceof NotSignedInError) {
+    return res.status(503).json({ error: "not_signed_in", message: "Claude Code isn't signed in on this machine. Run: npm run login" });
+  }
+  if (err instanceof SkillError) {
+    return res.status(err.code === "refused" ? 422 : 502).json({ error: err.code, message: err.code === "refused" ? `The ${what} couldn't be written.` : err.message });
+  }
+  if (err instanceof Anthropic.APIError) return sendApiError(res, err, what);
+  console.error(err);
+  return res.status(502).json({ error: "skill_error", message: `Claude couldn't write the ${what}. Try again.` });
 }
 
 // ---------- Product descriptions ----------
@@ -388,19 +471,7 @@ app.post("/api/campaign-email", async (req, res) => {
   }
 
   const site = companyUrl(contact.company_website || contact.website);
-  const productText = [
-    `Product name: ${product.name || "(not given)"}`,
-    `Product description: ${product.description || "(not given)"}`,
-    `Product page URL: ${product.pageUrl || "(not given)"}`,
-    docs.length ? "The product documentation follows." : "No product documentation was uploaded; rely on the description.",
-  ].join("\n");
-
-  // Product text and documents are identical for every contact in the
-  // campaign, so they sit before the cache breakpoint; the contact follows.
-  const productBlocks = [{ type: "text", text: productText }, ...docs.map((d) => ({ ...d }))];
-  productBlocks[productBlocks.length - 1].cache_control = { type: "ephemeral" };
-
-  const contactText = [
+  const taskText = [
     "Write the email for this contact.",
     "",
     "Contact record:",
@@ -409,80 +480,146 @@ app.post("/api/campaign-email", async (req, res) => {
     site ? `Company website: ${site.href}` : "No company website is recorded for this contact.",
   ].join("\n");
 
-  if (ENGINE === "subscription") {
-    const productLines = [
-      `Product name: ${product.name || "(not given)"}`,
-      `Product description: ${product.description || "(not given)"}`,
-      `Product page URL: ${product.pageUrl || "(not given)"}`,
-    ];
-    const docList = stored.fileNames.length
-      ? `The product documentation is in these files in your working directory. Read all of them before writing:\n${stored.fileNames.map((n) => `- ${n}`).join("\n")}`
-      : "No product documentation was uploaded; rely on the description.";
-    const prompt = [...productLines, "", docList, "", contactText].join("\n");
-    try {
-      const { output: email, fetchedWebsite } = await runWithSubscription({
-        system: await loadSkill(),
-        prompt,
-        cwd: stored.dir,
-        siteHost: site ? site.hostname.replace(/^www\./, "") : null,
-        schema: EMAIL_SCHEMA,
-      });
-      if (!email || !email.subject) {
-        return res.status(502).json({ error: "bad_output", message: "Claude's reply couldn't be read. Try again." });
-      }
-      return res.json({ email, fetchedWebsite });
-    } catch (err) {
-      if (err instanceof NotSignedInError) {
-        return res.status(503).json({ error: "not_signed_in", message: "Claude Code isn't signed in on this machine. Run: npm run login" });
-      }
-      console.error(err);
-      return res.status(502).json({ error: "subscription_error", message: "Claude couldn't write this email. Try again." });
-    }
+  try {
+    // High effort: the ROI example needs careful reading and arithmetic.
+    const { output: email, fetchedWebsite } = await runSkill({
+      skill: "campaign-email", product, stored, taskText, schema: EMAIL_SCHEMA, site,
+    });
+    if (!email?.subject) return res.status(502).json({ error: "bad_output", message: "Claude's reply couldn't be read. Try again." });
+    res.json({ email, fetchedWebsite });
+  } catch (err) {
+    sendSkillError(res, err, "email");
+  }
+});
+
+// ---------- Campaigns and qualified leads ----------
+
+// Records a launched campaign and its recipients.
+app.post("/api/campaigns", dataRoute(async (req, res) => {
+  const productId = String(req.body?.productId || "");
+  const contactIds = (Array.isArray(req.body?.contactIds) ? req.body.contactIds : []).map(Number).filter(Number.isInteger);
+  if (!validProductId(productId) || contactIds.length === 0) {
+    return res.status(400).json({ error: "bad_campaign", message: "Choose a product and at least one contact." });
+  }
+  const product = await db.getProduct(productId);
+  if (!product) return res.status(404).json({ error: "not_found", message: "That product no longer exists." });
+  const date = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+  res.status(201).json(await db.createCampaign(productId, `${product.name} campaign, ${date}`, contactIds));
+}));
+
+app.get("/api/leads", dataRoute(async (req, res) => {
+  res.json(await db.listLeads());
+}));
+
+app.get("/api/leads/:id/brief", dataRoute(async (req, res) => {
+  if (!validContactId(req.params.id)) return res.status(400).json({ error: "bad_lead", message: "Unknown lead." });
+  const brief = await db.getBrief(Number(req.params.id));
+  if (!brief) return res.status(404).json({ error: "no_brief", message: "No briefing has been written yet." });
+  res.json(brief);
+}));
+
+const BRIEF_SCHEMA = {
+  type: "object",
+  properties: {
+    company_overview: { type: "string" },
+    fit_reasons: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { reason: { type: "string" }, evidence: { type: "string" } },
+        required: ["reason", "evidence"],
+        additionalProperties: false,
+      },
+    },
+    roi: {
+      type: "object",
+      properties: { headline: { type: "string" }, explanation: { type: "string" }, basis: { type: "string" } },
+      required: ["headline", "explanation", "basis"],
+      additionalProperties: false,
+    },
+    objections: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { objection: { type: "string" }, response: { type: "string" } },
+        required: ["objection", "response"],
+        additionalProperties: false,
+      },
+    },
+    engagement_insight: { type: "string" },
+    research_notes: { type: "string" },
+  },
+  required: ["company_overview", "fit_reasons", "roi", "objections", "engagement_insight", "research_notes"],
+  additionalProperties: false,
+};
+
+function formatSeconds(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return m ? `${m} min ${s} s` : `${s} s`;
+}
+
+// Writes (or rewrites) the business development briefing for a lead, using
+// the lead-brief skill, and saves it in Supabase.
+app.post("/api/leads/:id/brief", async (req, res) => {
+  if (!db.dbConfigured) return res.status(503).json(DB_NOT_CONFIGURED);
+  if (!ENGINE) return res.status(503).json(NOT_CONFIGURED);
+  if (!validContactId(req.params.id)) return res.status(400).json({ error: "bad_lead", message: "Unknown lead." });
+
+  let lead;
+  let product;
+  let stored;
+  let names;
+  try {
+    lead = await db.getLead(Number(req.params.id));
+    if (!lead) return res.status(404).json({ error: "not_found", message: "That lead no longer exists." });
+    product = lead.campaign.productId ? await db.getProduct(lead.campaign.productId) : null;
+    if (!product) return res.status(422).json({ error: "no_product", message: "The campaign's product no longer exists." });
+    stored = await productContext(product);
+    names = await db.productNames();
+  } catch (err) {
+    console.error("Couldn't load the lead:", err.message || err);
+    return res.status(500).json({ error: "db_error", message: "The lead couldn't be loaded. Try again." });
   }
 
-  const tools = site
-    ? [{
-        type: "web_fetch_20260209",
-        name: "web_fetch",
-        max_uses: 3,
-        allowed_domains: [site.hostname.replace(/^www\./, "")],
-      }]
-    : [];
+  const c = lead.contact;
+  const contactRecord = {
+    name: c.name,
+    job_role: c.role,
+    company: c.company,
+    company_website: c.website,
+    employees: c.employees,
+    industry: c.industry,
+    buys_from_seller: c.products.map((id) => names[id]).filter(Boolean),
+    ...(Object.keys(c.extra || {}).length ? { additional_information: c.extra } : {}),
+  };
+  const engagement = [
+    `Opened the email: yes`,
+    `Time spent reading the email: ${formatSeconds(lead.readSeconds)}`,
+    `Clicked through to the product page: ${lead.clickedThrough ? "yes" : "no"}`,
+    `Time spent on the product page: ${lead.clickedThrough ? formatSeconds(lead.websiteSeconds) : "none"}`,
+  ];
+  const site = companyUrl(c.website);
+  const taskText = [
+    `Write the briefing for this lead from the "${lead.campaign.name}" campaign.`,
+    "",
+    "Contact record:",
+    JSON.stringify(contactRecord, null, 2),
+    "",
+    "Campaign engagement:",
+    ...engagement,
+    "",
+    site ? `Company website: ${site.href}` : "No company website is recorded for this contact.",
+  ].join("\n");
 
   try {
-    const system = await loadSkill();
-    const messages = [{ role: "user", content: [...productBlocks, { type: "text", text: contactText }] }];
-    let response;
-    for (let turn = 0; turn < 5; turn++) {
-      response = await client.beta.messages.create({
-        model: MODEL,
-        max_tokens: 16000,
-        // High effort: the ROI example needs careful reading and arithmetic.
-        output_config: { effort: "high", format: { type: "json_schema", schema: EMAIL_SCHEMA } },
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
-        system,
-        ...(tools.length ? { tools } : {}),
-        messages,
-      });
-      if (response.stop_reason !== "pause_turn") break;
-      messages.push({ role: "assistant", content: response.content });
-    }
-
-    if (response.stop_reason === "refusal") {
-      return res.status(422).json({ error: "refused", message: "An email couldn't be written for this contact." });
-    }
-    const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-    const email = text ? parseEmail(text) : null;
-    if (!email || !email.subject) {
-      console.error("Unexpected email output:", response.stop_reason, text.slice(0, 500));
-      return res.status(502).json({ error: "bad_output", message: "Claude's reply couldn't be read. Try again." });
-    }
-    const allBlocks = [...messages.slice(1).flatMap((m) => m.content), ...response.content];
-    const fetched = allBlocks.some((b) => b.type === "web_fetch_tool_result" && !b.content?.error_code);
-    res.json({ email, fetchedWebsite: fetched });
+    const { output, fetchedWebsite } = await runSkill({
+      skill: "lead-brief", product, stored, taskText, schema: BRIEF_SCHEMA, site,
+    });
+    if (!output?.company_overview) return res.status(502).json({ error: "bad_output", message: "Claude's reply couldn't be read. Try again." });
+    res.json(await db.saveBrief(lead.id, { ...output, fetchedWebsite, productName: product.name }));
   } catch (err) {
-    sendApiError(res, err, "campaign email");
+    sendSkillError(res, err, "briefing");
   }
 });
 

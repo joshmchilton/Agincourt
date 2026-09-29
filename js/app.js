@@ -251,19 +251,264 @@
 
   // ---------- Views ----------
 
-  function renderLeads() {
+  // ---------- Qualified leads ----------
+  // Contacts who opened a campaign email, with how they engaged, and a
+  // business development briefing written by the lead-brief skill.
+
+  function formatDuration(seconds) {
+    const s = Math.max(0, Math.round(seconds || 0));
+    const m = Math.floor(s / 60);
+    return m ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+  }
+
+  function formatWhen(iso) {
+    if (!iso) return "";
+    const hours = Math.round((Date.now() - new Date(iso).getTime()) / 3600000);
+    if (hours < 1) return "Just now";
+    if (hours < 24) return `${hours} ${hours === 1 ? "hour" : "hours"} ago`;
+    const days = Math.round(hours / 24);
+    return `${days} ${days === 1 ? "day" : "days"} ago`;
+  }
+
+  function yesNo(value) {
+    return value ? `<span class="mark yes" title="Yes">✓</span>` : `<span class="mark no" title="No">✕</span>`;
+  }
+
+  // Most engaged first: total time on the email and the product page.
+  function engagedSeconds(lead) {
+    return lead.readSeconds + lead.websiteSeconds;
+  }
+
+  async function renderLeads() {
     app.innerHTML = `
       <div class="page-head">
         <div>
           <h1>Qualified Leads</h1>
-          <p>This section is coming soon.</p>
+          <p>Contacts who opened a campaign email, most engaged first. Select a lead to see their briefing.</p>
         </div>
       </div>
-      <div class="pillars">
-        <div class="card pillar"><h2>Pipeline</h2><p>Charge ahead of rivals.</p></div>
-        <div class="card pillar"><h2>Deals</h2><p>Break through faster.</p></div>
-        <div class="card pillar"><h2>Admin</h2><p>Nothing slows the advance.</p></div>
+      <p class="generating">Loading leads…</p>`;
+
+    let data;
+    try {
+      data = await api("GET", "/api/leads");
+    } catch (err) {
+      app.querySelector(".generating").outerHTML = `<p class="description-note is-error">${esc(err.message)}</p>`;
+      return;
+    }
+    if (!location.hash.startsWith("#leads")) return; // navigated away while loading
+    state.leads = data.leads;
+
+    const campaigns = data.campaigns.filter((c) => c.sent > 0);
+    const summary = campaigns.map((c) => `
+      <div class="card campaign-summary">
+        <div class="campaign-summary-head">
+          <strong>${esc(c.name)}</strong>
+          ${c.isDemo ? `<span class="chip">Demo data</span>` : ""}
+        </div>
+        <span class="sub">Launched ${esc(formatWhen(c.launchedAt).toLowerCase())}</span>
+        <div class="metrics">
+          <div><span class="metric-value">${c.sent}</span><span class="metric-label">Sent</span></div>
+          <div><span class="metric-value">${c.opened}</span><span class="metric-label">Opened</span></div>
+          <div><span class="metric-value">${c.clicked}</span><span class="metric-label">Clicked through</span></div>
+        </div>
+      </div>`).join("");
+
+    const leads = [...data.leads].sort((a, b) => engagedSeconds(b) - engagedSeconds(a));
+    const table = leads.length ? `
+      <div class="table-wrap">
+        <table class="leads-table">
+          <thead>
+            <tr>
+              <th>Contact</th>
+              <th>Company</th>
+              <th>Campaign</th>
+              <th class="center">Email opened</th>
+              <th class="num">Time reading email</th>
+              <th class="center">Clicked through</th>
+              <th class="num">Time on website</th>
+              <th>Opened</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${leads.map((l) => `
+              <tr class="lead-row" data-lead="${l.id}" tabindex="0">
+                <td><a class="lead-link" href="#lead/${l.id}">${esc(l.contact.name)}</a><span class="sub">${esc(l.contact.role)}</span></td>
+                <td>${esc(l.contact.company)}</td>
+                <td>${esc(l.campaign.name)}</td>
+                <td class="center">${yesNo(true)}</td>
+                <td class="num">${formatDuration(l.readSeconds)}</td>
+                <td class="center">${yesNo(l.clickedThrough)}</td>
+                <td class="num">${l.clickedThrough ? formatDuration(l.websiteSeconds) : "–"}</td>
+                <td style="white-space:nowrap">${esc(formatWhen(l.openedAt))}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>` : `
+      <div class="card">
+        <h2>No qualified leads yet</h2>
+        <p class="empty-note" style="margin-top:6px">Contacts appear here once they open a campaign email.</p>
       </div>`;
+
+    app.innerHTML = `
+      <div class="page-head">
+        <div>
+          <h1>Qualified Leads</h1>
+          <p>Contacts who opened a campaign email, most engaged first. Select a lead to see their briefing.</p>
+        </div>
+      </div>
+      ${summary ? `<div class="campaign-summaries">${summary}</div>` : ""}
+      ${table}`;
+
+    app.querySelectorAll(".lead-row").forEach((row) => {
+      row.addEventListener("click", (e) => {
+        if (e.target.closest("a")) return;
+        location.hash = `#lead/${row.dataset.lead}`;
+      });
+      row.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") location.hash = `#lead/${row.dataset.lead}`;
+      });
+    });
+  }
+
+  // Briefings already fetched or written this session, by lead id.
+  const briefs = new Map();
+
+  async function renderLeadDetail(param) {
+    const id = Number(param);
+    let lead = (state.leads || []).find((l) => l.id === id);
+    if (!lead) {
+      try {
+        state.leads = (await api("GET", "/api/leads")).leads;
+      } catch (err) {
+        return reportError(err);
+      }
+      lead = state.leads.find((l) => l.id === id);
+    }
+    if (!lead) {
+      location.hash = "#leads";
+      return;
+    }
+    const c = lead.contact;
+    const product = productById(lead.campaign.productId);
+
+    app.innerHTML = `
+      <div class="page-head">
+        <div>
+          <a class="back-link" href="#leads">← Qualified Leads</a>
+          <h1>${esc(c.name)}</h1>
+          <p>${esc([c.role, c.company].filter(Boolean).join(", "))}${c.website ? ` · <a class="site-link" href="${esc(websiteHref(c.website))}" target="_blank" rel="noopener">${esc(c.website)}</a>` : ""}</p>
+        </div>
+        <div class="actions">
+          <button class="btn" id="rewrite-brief" hidden>Rewrite briefing</button>
+        </div>
+      </div>
+
+      <div class="metrics lead-metrics">
+        <div class="card"><span class="metric-label">Email opened</span><span class="metric-value">Yes</span><span class="sub">${esc(formatWhen(lead.openedAt))}</span></div>
+        <div class="card"><span class="metric-label">Time reading email</span><span class="metric-value">${formatDuration(lead.readSeconds)}</span></div>
+        <div class="card"><span class="metric-label">Clicked through</span><span class="metric-value">${lead.clickedThrough ? "Yes" : "No"}</span></div>
+        <div class="card"><span class="metric-label">Time on website</span><span class="metric-value">${lead.clickedThrough ? formatDuration(lead.websiteSeconds) : "–"}</span></div>
+      </div>
+      ${lead.campaign.isDemo ? `<p class="empty-note" style="margin:-8px 0 20px">Engagement figures are demo data. Campaign: ${esc(lead.campaign.name)}.</p>` : `<p class="empty-note" style="margin:-8px 0 20px">Campaign: ${esc(lead.campaign.name)}.</p>`}
+
+      <div class="brief-layout">
+        <div id="brief" class="brief"></div>
+        <aside class="card brief-contact">
+          <h2><span class="brief-step">5</span>Customer contact</h2>
+          <dl>
+            <dt>Name</dt><dd>${esc(c.name)}</dd>
+            <dt>Email</dt><dd><a class="site-link" href="mailto:${esc(c.email)}">${esc(c.email)}</a></dd>
+            <dt>Phone</dt><dd>${c.phone ? `<a class="site-link" href="tel:${esc(c.phone.replace(/[^\d+]/g, ""))}">${esc(c.phone)}</a>` : "Not recorded"}</dd>
+          </dl>
+        </aside>
+      </div>`;
+
+    app.querySelector("#rewrite-brief").addEventListener("click", () => writeBrief(lead, true));
+    showBrief(lead, product);
+  }
+
+  async function showBrief(lead, product) {
+    // Always check Supabase first: the lead list may predate a new briefing.
+    let brief = briefs.get(lead.id);
+    if (!brief) {
+      setBriefHtml(lead, `<p class="generating">Loading the briefing…</p>`);
+      try {
+        brief = await api("GET", `/api/leads/${lead.id}/brief`);
+        briefs.set(lead.id, brief);
+      } catch (err) {
+        if (err.status !== 404) return setBriefHtml(lead, `<p class="description-note is-error">${esc(err.message)}</p>`);
+      }
+    }
+    if (brief) return renderBrief(lead, brief);
+    if (!state.ai) {
+      return setBriefHtml(lead, `<div class="card"><p class="empty-note">Connect Claude on the server (an API key, or npm run start:local for testing) to write briefings.</p></div>`);
+    }
+    writeBrief(lead, false, product);
+  }
+
+  function setBriefHtml(lead, html) {
+    if (location.hash !== `#lead/${lead.id}`) return false;
+    const el = document.getElementById("brief");
+    if (el) el.innerHTML = html;
+    return Boolean(el);
+  }
+
+  async function writeBrief(lead, rewrite, product = productById(lead.campaign.productId)) {
+    const productName = product?.name || "the product";
+    const button = document.getElementById("rewrite-brief");
+    if (button) button.hidden = true;
+    setBriefHtml(lead, `
+      <div class="card">
+        <p class="generating">${rewrite ? "Rewriting" : "Writing"} the briefing: reviewing ${esc(lead.contact.website || "the company")} and the ${esc(productName)} documentation. This takes about a minute.</p>
+      </div>`);
+    try {
+      const brief = await api("POST", `/api/leads/${lead.id}/brief`);
+      briefs.set(lead.id, brief);
+      lead.hasBrief = true;
+      renderBrief(lead, brief);
+    } catch (err) {
+      setBriefHtml(lead, `
+        <div class="card">
+          <p class="description-note is-error">${esc(err.message)}</p>
+          <button class="btn btn-small" id="retry-brief" style="margin-top:10px">Try again</button>
+        </div>`);
+      document.getElementById("retry-brief")?.addEventListener("click", () => writeBrief(lead, rewrite));
+    }
+  }
+
+  function renderBrief(lead, b) {
+    const shown = setBriefHtml(lead, `
+      <section class="card brief-section">
+        <h2><span class="brief-step">1</span>Company overview</h2>
+        <p>${esc(b.company_overview)}</p>
+        ${b.engagement_insight ? `<p class="brief-insight"><strong>Engagement:</strong> ${esc(b.engagement_insight)}</p>` : ""}
+      </section>
+
+      <section class="card brief-section">
+        <h2><span class="brief-step">2</span>Why ${esc(b.productName || "the product")} is a good fit</h2>
+        <ol class="brief-list">
+          ${(b.fit_reasons || []).map((r) => `<li><strong>${esc(r.reason)}</strong><span class="brief-evidence">${esc(r.evidence)}</span></li>`).join("")}
+        </ol>
+      </section>
+
+      <section class="card brief-section">
+        <h2><span class="brief-step">3</span>ROI</h2>
+        <p class="roi-headline">${esc(b.roi?.headline || "")}</p>
+        <p>${esc(b.roi?.explanation || "")}</p>
+        ${b.roi?.basis ? `<details class="brief-basis"><summary>How the ROI was worked out</summary><p>${esc(b.roi.basis)}</p></details>` : ""}
+      </section>
+
+      <section class="card brief-section">
+        <h2><span class="brief-step">4</span>Likely objections and responses</h2>
+        <dl class="objections">
+          ${(b.objections || []).map((o) => `<dt>“${esc(o.objection)}”</dt><dd>${esc(o.response)}</dd>`).join("")}
+        </dl>
+      </section>
+
+      <p class="empty-note brief-footnote">${esc(b.research_notes || "")}${b.fetchedWebsite === false ? " The company website couldn't be reached." : ""} Written ${esc(formatWhen(b.writtenAt).toLowerCase())}.</p>`);
+    const button = document.getElementById("rewrite-brief");
+    if (shown && button) button.hidden = false;
   }
 
   function renderCampaigns() {
@@ -1002,13 +1247,23 @@
     });
 
     const launch = app.querySelector("#launch");
-    if (launch) launch.addEventListener("click", () => {
+    if (launch) launch.addEventListener("click", async () => {
       const now = emailCounts(campaign, contacts);
       if (now.waiting) {
         showToast(`Emails are still being written: ${now.done} of ${contacts.length} done`);
         return;
       }
       if (now.error && !confirm(`${now.error} ${now.error === 1 ? "email" : "emails"} couldn't be written and will be left out. Launch anyway?`)) return;
+      // Record the campaign and its recipients, so engagement can be tracked
+      // on the Qualified Leads page.
+      const recipients = contacts.filter((c) => campaign.emails.get(c.id)?.status === "done").map((c) => c.id);
+      launch.disabled = true;
+      try {
+        await api("POST", "/api/campaigns", { productId: campaign.productId, contactIds: recipients });
+      } catch (err) {
+        launch.disabled = false;
+        return reportError(err);
+      }
       campaign.launched = true;
       renderPreview();
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1100,20 +1355,22 @@
   // ---------- Routing ----------
 
   const routes = {
-    leads: renderLeads,
     campaigns: renderCampaigns,
     opportunities: renderCustomers,
     preview: renderPreview,
+    leads: renderLeads,
+    lead: renderLeadDetail, // #lead/<engagement id>
   };
 
   function route() {
-    const name = location.hash.replace("#", "") || "campaigns";
+    const [name, param] = (location.hash.replace("#", "") || "campaigns").split("/");
     const view = routes[name] || renderCampaigns;
-    const activeTab = name === "preview" ? "opportunities" : (routes[name] ? name : "campaigns");
+    const parentTab = { preview: "opportunities", lead: "leads" };
+    const activeTab = parentTab[name] || (routes[name] ? name : "campaigns");
     document.querySelectorAll(".tabs a").forEach((a) => {
       a.classList.toggle("active", a.dataset.tab === activeTab);
     });
-    view();
+    view(param);
     window.scrollTo(0, 0);
   }
 

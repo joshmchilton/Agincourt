@@ -34,16 +34,20 @@ npm run start:local
 
 ## Sections
 
-- **Qualified Leads**: coming soon.
-- **Campaign Builder**: one card per product, and **Add product** to promote more. For each product, enter the product page URL (for the "Learn more" link) and a description, and upload product information (PDF, Word .docx, or text files) for the campaign email skill. Then click **Create Campaign**. Each product gets its own column in the Opportunity Database.
-- **Opportunity Database**: contacts with company website, employee count, industry, and ticks for the products they buy. Add contacts one at a time or upload an Excel/CSV file (a template is available from the upload dialog); contacts are saved in the browser. When a campaign is started, everyone who doesn't buy that product is preselected; adjust the selection and click **Continue**.
-- **Campaign preview**: the `campaign-email` skill writes a bespoke email for each selected contact from the product documents, the company's website, and the contact's record (including any extra columns from the upload). Review them, then **Approve and Launch Campaign**.
+The tabs are numbered in the order they're used:
+
+1. **Campaign Builder**: one card per product, and **Add product** to promote more. For each product, add the product page URL (for the "Learn more" link) and upload product information (PDF, Word .docx, or text files); Claude writes a short description from the documents, which you can edit. Then click **Create Campaign**.
+2. **Opportunity Database**: contacts with company website, employee count, industry, and ticks for the products they buy. Add, edit, delete, or upload contacts from Excel/CSV. When a campaign is started, everyone who doesn't buy that product is preselected; adjust the selection and click **Continue**. The campaign preview then has the `campaign-email` skill write a bespoke email for each contact; **Approve and Launch Campaign** records the campaign and its recipients.
+3. **Qualified Leads**: contacts who opened a campaign email, with time spent reading it, whether they clicked through, and time on the website. Select a lead for a briefing written by the `lead-brief` skill: company overview, why the product fits, ROI, likely objections and responses, and contact details. Briefings are saved, and can be rewritten.
+
+Email sending and open/click tracking aren't connected yet, so the Qualified Leads page currently shows a demo campaign with random engagement data for 10 contacts.
 
 ## Project layout
 
 ```
 server.js        Serves the app and calls Claude for campaign emails
 skills/campaign-email/SKILL.md   Instructions Claude follows to write each campaign email
+skills/lead-brief/SKILL.md       Instructions Claude follows to write each lead briefing
 index.html       Page shell and navigation
 css/styles.css   Herald theme
 db.js            Supabase reads and writes (server only)
@@ -62,5 +66,7 @@ Everything is stored in the linked Supabase project:
 - `products`: name, product page URL, and description for each product on the Campaign Builder.
 - `product_documents`: uploaded product information; the files are in the private `product-documents` Storage bucket.
 - `contacts`: the Opportunity Database, including the products each contact buys and any extra spreadsheet columns.
+- `campaigns` and `campaign_engagements`: launched campaigns, their recipients, and whether each opened the email, time spent reading, click-through, and time on the website.
+- `lead_briefs`: saved briefings for qualified leads.
 
 Row level security is on with no policies, so only the server (using the secret key) can read or write data. Schema changes live in `supabase/migrations/` and are applied with `npx supabase db push`.
